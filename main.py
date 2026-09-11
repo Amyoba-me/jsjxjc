@@ -702,7 +702,7 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
     except Exception:
         pass
 
-# 2. Получаем посты через /s/
+    # 2. Получаем посты через /s/ и ищем закреп
     public_url = f"https://t.me/s/{username}"
     try:
         async with await http.get(public_url) as response:
@@ -721,41 +721,38 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
 
     soup = BeautifulSoup(raw, "lxml")
     
-    # НОВЫЙ ПОИСК ЗАКРЕПЛЕННЫХ СООБЩЕНИЙ:
-    # Ищем блоки сообщений, которые имеют признак закрепления в веб-версии t.me/s/
-    for post in soup.select(".tgme_widget_message"):
-        # Проверяем, является ли пост закрепленным (в разметке t.me/s/ закреп часто имеет специфический класс или обертку)
-        is_pinned_post = bool(post.find_parent(class_=re.compile(r"pinned", re.I))) or \
-                         bool(post.select_one(".tgme_widget_message_owner_name [href*='post']"))
-        
-        # Также вытаскиваем ссылку на сам пост, если она есть в шапке сообщения
-        link_elem = post.select_one(".tgme_widget_message_date")
-        if link_elem and link_elem.has_attr("href"):
-            post_url = link_elem["href"]
-            if is_pinned_post and post_url:
-                pinned_messages.add(post_url)
-
-    # Дополнительно проверяем все ссылки, содержащие слово pinned или блок с закреплением
+    # Ищем плашку закрепленного сообщения вверху t.me/s/ (обычно имеет классы с 'pinned' или 'widget_message_wrap')
+    # Вытаскиваем из неё ссылки на конкретный пост (например, href="/username/123" или data-post="username/123")
     for tag in soup.find_all(class_=re.compile(r"pinned|message_pinned", re.I)):
-        href = tag.get("href")
-        if href and f"/{username}/" in href:
-            pinned_messages.add(href if href.startswith("http") else f"https://t.me{href}")
+        # Проверяем все ссылки внутри блока закрепа
+        for a_tag in tag.find_all("a", href=True):
+            href = a_tag["href"]
+            if f"/{username}/" in href:
+                full_url = href if href.startswith("http") else f"https://t.me{href}"
+                pinned_messages.add(full_url)
         
+        # Проверяем data-атрибуты
         data_post = tag.get("data-post")
         if data_post:
             pinned_messages.add(f"https://t.me/{data_post}")
 
-    # Обрабатываем основные посты до лимита
+    # Дополнительно: сканируем ВСЕ ссылки на самой странице на предмет наличия id поста закрепа, 
+    # если они попадаются в шапке канала
+    for a in soup.select(".tgme_header_link, .tgme_channel_info_header a, a[href*='/{username}/']"):
+        href = a.get("href", "")
+        parts = href.strip("/").split("/")
+        if len(parts) >= 2 and parts[-1].isdigit() and parts[-2] == username:
+            pinned_messages.add(f"https://t.me/{username}/{parts[-1]}")
+
+    # Обрабатываем основные посты ленты до лимита
     posts = soup.select(".tgme_widget_message")
     for post in posts[:MAX_TELEGRAM_POSTS]:
         text_node = post.select_one(".tgme_widget_message_text")
-
         if text_node:
             texts.append(text_node.get_text(" ", strip=True))
 
         if post.find(class_=re.compile(r"round_video")):
             node.has_round_video = True
-        
         if post.find(class_=re.compile(r"voice")):
             node.has_voice = True
 
@@ -764,14 +761,13 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
             if href.startswith(("http://", "https://")):
                 links.add(normalize_url(href))
 
-    # 3. Принудительно парсим закрепленные сообщения и целевой message_id (вне лимита 200 постов)
+    # 3. Принудительно запрашиваем закрепленные сообщения и целевой message_id через ?embed=1
     target_messages = pinned_messages.copy()
     if message_id:
         target_messages.add(f"https://t.me/{username}/{message_id}")
         
     for msg_url in target_messages:
         try:
-            # ?embed=1 надёжнее для парсинга единичных постов через виджет
             fetch_url = msg_url if "?embed" in msg_url else f"{msg_url}?embed=1"
             async with await http.get(fetch_url) as response:
                 if response.status == 200:
@@ -856,7 +852,7 @@ PATTERNS = {
         r"\bличное\b",
         r"\bличный контент\b",
         r"\bосновной\b",
-        r"\bосновнойтгк\b",
+        r"\bосновнойтгк\",
         r"\bосновной тгк\b"
         r"\bоснова\b",
         r"\bповседневн\b",
@@ -1142,7 +1138,7 @@ def build_report(
 
     report = (
         "🚨 <b>ПРОВЕРКА РЕСУРСА</b>\n\n"
-        f"<b>Вердикт:</b> {VERDIcripts.get(result.verdict, result.verdict)}\n"
+        f"<b>Вердикт:</b> {VERDICTS.get(result.verdict, result.verdict)}\n"
         f"<b>Оценка риска:</b> {result.score}/100\n"
         f"<b>Уверенность:</b> {round(result.confidence * 100)}%\n\n"
         f"<b>Исходная ссылка:</b>\n"
