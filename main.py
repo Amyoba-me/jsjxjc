@@ -702,7 +702,7 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
     except Exception:
         pass
 
-    # 2. Получаем посты через /s/
+# 2. Получаем посты через /s/
     public_url = f"https://t.me/s/{username}"
     try:
         async with await http.get(public_url) as response:
@@ -721,15 +721,28 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
 
     soup = BeautifulSoup(raw, "lxml")
     
-    # Поиск закреплённых постов (ищем классы с 'pinned' и data-post)
-    for tag in soup.find_all(class_=re.compile(r"pinned", re.I)):
+    # НОВЫЙ ПОИСК ЗАКРЕПЛЕННЫХ СООБЩЕНИЙ:
+    # Ищем блоки сообщений, которые имеют признак закрепления в веб-версии t.me/s/
+    for post in soup.select(".tgme_widget_message"):
+        # Проверяем, является ли пост закрепленным (в разметке t.me/s/ закреп часто имеет специфический класс или обертку)
+        is_pinned_post = bool(post.find_parent(class_=re.compile(r"pinned", re.I))) or \
+                         bool(post.select_one(".tgme_widget_message_owner_name [href*='post']"))
+        
+        # Также вытаскиваем ссылку на сам пост, если она есть в шапке сообщения
+        link_elem = post.select_one(".tgme_widget_message_date")
+        if link_elem and link_elem.has_attr("href"):
+            post_url = link_elem["href"]
+            if is_pinned_post and post_url:
+                pinned_messages.add(post_url)
+
+    # Дополнительно проверяем все ссылки, содержащие слово pinned или блок с закреплением
+    for tag in soup.find_all(class_=re.compile(r"pinned|message_pinned", re.I)):
         href = tag.get("href")
         if href and f"/{username}/" in href:
-            href_clean = href if href.startswith("http") else f"https://t.me{href}"
-            pinned_messages.add(href_clean)
-            
+            pinned_messages.add(href if href.startswith("http") else f"https://t.me{href}")
+        
         data_post = tag.get("data-post")
-        if data_post and data_post.startswith(f"{username}/"):
+        if data_post:
             pinned_messages.add(f"https://t.me/{data_post}")
 
     # Обрабатываем основные посты до лимита
@@ -842,7 +855,11 @@ PATTERNS = {
         r"\bличный пост\b",
         r"\bличное\b",
         r"\bличный контент\b",
-        r"\bповседневн",
+        r"\bосновной\b",
+        r"\bосновнойтгк\",
+        r"\bосновной тгк\b"
+        r"\bоснова\b",
+        r"\bповседневн\b",
         r"\bмоя жизнь\b",
         r"\bиз жизни\b",
     ],
