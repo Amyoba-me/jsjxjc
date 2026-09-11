@@ -165,6 +165,8 @@ class ResourceNode:
     telegram: bool = False
     accessible: bool = True
     error: Optional[str] = None
+    has_round_video: bool = False
+    has_voice: bool = False
 
 
 @dataclass
@@ -710,6 +712,14 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
         if text_node:
             texts.append(text_node.get_text(" ", strip=True))
 
+        # --- НОВАЯ ЛОГИКА ДЕТЕКТА МЕДИАФАЙЛОВ ---
+        if post.find(class_=re.compile(r"round_video")):
+            node.has_round_video = True
+        
+        if post.find(class_=re.compile(r"voice")):
+            node.has_voice = True
+        # ----------------------------------------
+
         for a in post.find_all("a", href=True):
             href = (a.get("href") or "").strip()
             if href.startswith(("http://", "https://")):
@@ -804,6 +814,19 @@ PATTERNS = {
         r"\bмоя жизнь\b",
         r"\bиз жизни\b",
     ],
+    "first_person_lifestyle": [
+        r"\bтут я\b",
+        r"\bскидываю\b",
+        r"\bпривет(,\s*|\s+)",
+        r"\bвлог\b",
+        r"\bмои будни\b",
+        r"\bмоя жизнь\b",
+        r"\bкружочек\b",
+        r"\bголосовое\b",
+        r"\bзабыли\b",
+        r"\bбыли в\b",
+        r"\bсоседи\b",
+    ],
     "work_in_progress": [
         r"\bwip\b",
         r"\bw\.i\.p\b",
@@ -868,6 +891,8 @@ PATTERNS = {
         r"\bфото с собой\b",
         r"\bмоя фотка\b",
         r"\bмоя фотография\b",
+        r"\bфотками\b",
+        r"\bфотки\b",
     ],
 }
 
@@ -889,6 +914,10 @@ def detect_features(nodes: list[ResourceNode]) -> dict:
         node.telegram and node.depth > 0 for node in nodes
     )
     features["has_external_links"] = any(node.links for node in nodes)
+    
+    # --- НОВЫЕ ФИЧИ МЕДИАКУЛЮЧЕЙ ---
+    features["has_round_video"] = any(getattr(node, "has_round_video", False) for node in nodes)
+    features["has_voice"] = any(getattr(node, "has_voice", False) for node in nodes)
 
     features["has_work_signals"] = any(
         features.get(name, False)
@@ -959,25 +988,34 @@ async def classify(nodes: list[ResourceNode]) -> Classification:
         reasons.append(reason)
         rules.append(rule)
 
-    if features["personal_posts"]:
+    if features.get("personal_posts"):
         add(28, "обнаружены личные посты", "8.1.1")
+        
+    if features.get("first_person_lifestyle"):
+        add(20, "обнаружено общение от первого лица / лайфстайл", "8.1.1")
 
-    if features["work_in_progress"]:
+    if features.get("work_in_progress"):
         add(18, "обнаружены стадии работ / WIP", "8.1.1")
 
-    if features["reposts"]:
+    if features.get("reposts"):
         add(12, "обнаружены репосты", "8.1.1")
 
-    if features["self_promotion"]:
+    if features.get("self_promotion"):
         add(12, "обнаружен личный самопиар", "8.1.1")
 
-    if features["spoilers"]:
+    if features.get("spoilers"):
         add(10, "обнаружены спойлеры", "8.1.1")
 
-    if features["personal_photos"]:
+    if features.get("personal_photos"):
         add(18, "обнаружен личный фотоконтент", "8.1.1")
+        
+    if features.get("has_round_video"):
+        add(30, "обнаружены кружочки (характерно для личных блогов)", "8.1.1")
 
-    if features["has_nested_telegram"]:
+    if features.get("has_voice"):
+        add(15, "обнаружены голосовые сообщения", "8.1.1")
+
+    if features.get("has_nested_telegram"):
         add(25, "обнаружен Telegram-ресурс в цепочке переходов", "8.2.1")
 
     work_signals = sum(
