@@ -1,618 +1,2003 @@
-import os
-import io
+"""
+Telegram Resource Checker — single-file version.
+
+Environment variables:
+    BOT_TOKEN              required
+    MOD_CHAT_ID            required
+    DB_PATH                optional, default /data/checker.db
+    MAX_DEPTH              optional, default 3
+    MAX_RESOURCES          optional, default 40
+    MAX_TELEGRAM_POSTS     optional, default 40
+    REQUEST_TIMEOUT        optional, default 15
+    MIN_ALERT_SCORE        optional, default 55
+    ADMIN_IDS              optional, comma-separated Telegram IDs
+
+Install:
+    pip install aiogram aiohttp beautifulsoup4 aiosqlite lxml
+
+Run:
+    python bot.py
+"""
+
+from __future__ import annotations
+
 import asyncio
-import random
-import re
+import hashlib
+import html
+import json
 import logging
-from html.parser import HTMLParser
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+from urllib.parse import urldefrag, urljoin, urlparse
 
 import aiohttp
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-
-from aiogram import Bot, Dispatcher, types
-from aiogram import F
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from bs4 import BeautifulSoup
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-if not BOT_TOKEN:
-    raise ValueError(
-        "Переменная окружения BOT_TOKEN не найдена! "
-        "Убедитесь, что вы указали BOT_TOKEN в настройках хостинга."
-    )
+# ============================================================
+# CONFIG
+# ============================================================
 
-logging.basicConfig(level=logging.INFO)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MOD_CHAT_ID = int(os.getenv("MOD_CHAT_ID", "0"))
 
-# 1. Цветовая гамма племен и запахов
-SMELL_MAP = {
-    "#dfdc8f": "Племя Ветра 🌾",
-    "#ff861c": "Племя Солнца ☀️",
-    "#00b4d8": "Племя Потока 🌊",
-    "#71c68b": "Племя Мрака 🌲",
-    "#576198": "Клан Горных Вершин 🏔️",
-    "#befffb": "Звёздные Угодья ✨",
-    "#f777a6": "Домашки 🏠",
-    "#e3d1c8": "Одиночки 🐾",
-    "#911922": "Сумеречный Лес 🌑",
+DB_PATH = os.getenv(
+    "DB_PATH",
+    "/data/checker.db",
+)
+
+MAX_DEPTH = int(os.getenv("MAX_DEPTH", "3"))
+MAX_RESOURCES = int(os.getenv("MAX_RESOURCES", "40"))
+MAX_TELEGRAM_POSTS = int(
+    os.getenv("MAX_TELEGRAM_POSTS", "40")
+)
+REQUEST_TIMEOUT = int(
+    os.getenv("REQUEST_TIMEOUT", "15")
+)
+MIN_ALERT_SCORE = int(
+    os.getenv("MIN_ALERT_SCORE", "55")
+)
+
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
 }
 
-active_tasks = {}
+USER_AGENT = (
+    "Mozilla/5.0 "
+    "(compatible; TelegramResourceChecker/2.0)"
+)
 
-def parse_color_to_name(color_raw: str) -> str:
-    """Определяет запах племени по HEX или RGB строке."""
-    if not color_raw:
-        return "Неизвестно"
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not configured")
 
-    color_raw = color_raw.strip().lower()
+if not MOD_CHAT_ID:
+    raise RuntimeError("MOD_CHAT_ID is not configured")
 
-    rgb_match = re.search(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", color_raw)
-    if rgb_match:
-        r, g, b = map(int, rgb_match.groups())
-        hex_code = f"#{r:02x}{g:02x}{b:02x}"
-        return SMELL_MAP.get(hex_code, f"Неизвестный запах ({hex_code})")
 
-    hex_match = re.search(r"#[0-9a-f]{6}\b", color_raw)
-    if hex_match:
-        hex_code = hex_match.group(0)
-        return SMELL_MAP.get(hex_code, f"Неизвестный запах ({hex_code})")
+# ============================================================
+# LOGGING
+# ============================================================
 
-    if color_raw in SMELL_MAP:
-        return SMELL_MAP[color_raw]
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
-    return color_raw
+log = logging.getLogger("telegram-resource-checker")
 
-class SimpleHTMLTextExtractor(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.result = []
 
-    def handle_data(self, data):
-        cleaned = data.strip()
-        if cleaned:
-            self.result.append(cleaned)
+# ============================================================
+# CONSTANTS
+# ============================================================
 
-def extract_smell_from_html(html_content: str) -> str:
-    """Извлечение запаха из style-тегов."""
-    smell_pattern = r"Запах племени:\s*<span[^>]*style=[\"']([^\"']+)[\"'][^>]*>"
-    match = re.search(smell_pattern, html_content, re.IGNORECASE)
-    if match:
-        style_str = match.group(1)
-        color_match = re.search(r"background(?:-color)?:\s*([^;]+)", style_str, re.I) or \
-                      re.search(r"color:\s*([^;]+)", style_str, re.I)
-        if color_match:
-            return parse_color_to_name(color_match.group(1).strip())
-    return "Неизвестно"
+VERDICTS = {
+    "WORK": "🟢 Рабочий",
+    "PERSONAL": "🔴 Личный",
+    "SUSPICIOUS": "🟠 Подозрительный",
+    "UNKNOWN": "⚪ Не удалось определить",
+}
 
-def parse_character_data(html_content: str, char_id: int) -> dict:
-    """Парсинг имени, запаха, родителей, боевых умений и часов в игре."""
-    parser = SimpleHTMLTextExtractor()
-    parser.feed(html_content)
-    tokens = parser.result
+RULES_TEXT = {
+    "8.1.1": (
+        "Личный ресурс содержит личное пространство автора: "
+        "щитпосты, повседневные посты, стадии работ, спойлеры, "
+        "репосты, самопиар и другой личный контент."
+    ),
+    "8.1.2": (
+        "К личным ресурсам относятся личные Telegram-каналы/группы, "
+        "арт-каналы и блоги с собственными рисунками и другой "
+        "нерабочий контент."
+    ),
+    "8.1.3": (
+        "Рабочий портфолио-/прайс-ресурс разрешён, если содержит "
+        "только рабочую информацию."
+    ),
+    "8.1.4": (
+        "В рабочем ресурсе не должно быть ссылок на личные ресурсы."
+    ),
+    "8.1.5": (
+        "Связанные сообщества также должны соответствовать требованиям."
+    ),
+    "8.2.1": (
+        "Нельзя размещать ресурс, внутри которого находится путь "
+        "к личному сообществу."
+    ),
+    "8.2.2": (
+        "Передача такой ссылки от другого лица не отменяет нарушение."
+    ),
+    "8.2.3": (
+        "Правило действует для цепочек переходов."
+    ),
+    "8.3.1": (
+        "Рабочий ресурс используется для показа работ и приёма заказов."
+    ),
+    "8.3.2": (
+        "Личный ресурс содержит личный контент вместе с работами."
+    ),
+    "8.3.3": (
+        "Само наличие портфолио не делает ресурс личным."
+    ),
+}
 
-    name = f"Персонаж {char_id}"
-    if "Общий рейтинг:" in tokens:
-        idx = tokens.index("Общий рейтинг:")
-        if idx >= 2:
-            name = tokens[idx - 2]
+URL_RE = re.compile(
+    r"(?i)\b("
+    r"https?://[^\s<>\"]+"
+    r"|www\.[^\s<>\"]+"
+    r"|t\.me/[^\s<>\"]+"
+    r")"
+)
 
-    smell = extract_smell_from_html(html_content)
+TELEGRAM_HOSTS = {
+    "t.me",
+    "telegram.me",
+    "www.t.me",
+    "www.telegram.me",
+}
 
-    # Парсинг родителей
-    parents = []
-    link_matches = re.finditer(r'<a[^>]+href=["\'](?:https?://[^/]+)?/p/(\d+)["\'][^>]*>(.*?)</a>', html_content, re.IGNORECASE | re.DOTALL)
-    
-    for match in link_matches:
-        target_id = int(match.group(1))
-        raw_text = match.group(2)
-        target_name = re.sub(r'<[^>]+>', '', raw_text).strip() or f"ID {target_id}"
 
-        start_pos = max(0, match.start() - 150)
-        end_pos = min(len(html_content), match.end() + 150)
-        snippet = html_content[start_pos:end_pos].lower()
+# ============================================================
+# DATA CLASSES
+# ============================================================
 
-        if any(w in snippet for w in ["родител", "мать", "отец", "родители"]):
-            parents.append({"id": target_id, "name": target_name})
+@dataclass
+class ResourceNode:
+    url: str
+    depth: int
+    parent: Optional[str] = None
+    final_url: Optional[str] = None
+    title: str = ""
+    text: str = ""
+    links: list[str] = field(default_factory=list)
+    telegram: bool = False
+    accessible: bool = True
+    error: Optional[str] = None
 
-    unique_parents = {}
-    for p in parents:
-        unique_parents[p["id"]] = p["name"]
 
-    # Парсинг боевых умений и времени в игре
-    combat_skills = 0
-    combat_match = re.search(r"Боевые\s+умения:\s*(\d+)", html_content, re.IGNORECASE)
-    if combat_match:
-        combat_skills = int(combat_match.group(1))
+@dataclass
+class Classification:
+    verdict: str
+    score: int
+    confidence: float
+    reasons: list[str]
+    rules: list[str]
+    features: dict
+    telegram_resources: list[str]
 
-    game_hours = 0.0
-    time_match = re.search(r"(?:Время в игре|Игровое время):\s*([\d\.,]+)\s*(?:ч|часов|ч\.)", html_content, re.IGNORECASE)
-    if time_match:
-        try:
-            game_hours = float(time_match.group(1).replace(",", "."))
-        except ValueError:
-            game_hours = 0.0
 
+# ============================================================
+# HELPERS
+# ============================================================
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_url(url: str) -> str:
+    url = url.strip().strip(".,;:!?)]}>\"'")
+
+    if url.startswith("www."):
+        url = "https://" + url
+    elif url.startswith("t.me/"):
+        url = "https://" + url
+    elif not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+
+    url, _ = urldefrag(url)
+    parsed = urlparse(url)
+
+    scheme = parsed.scheme.lower()
+    host = parsed.netloc.lower().split(":")[0]
+
+    path = re.sub(r"/+", "/", parsed.path)
+
+    return f"{scheme}://{host}{path}".rstrip("/")
+
+
+def is_telegram_url(url: str) -> bool:
+    try:
+        host = (
+            urlparse(url)
+            .netloc
+            .lower()
+            .split(":")[0]
+        )
+        return host in TELEGRAM_HOSTS
+    except Exception:
+        return False
+
+
+def extract_urls(text: str) -> list[str]:
+    result = []
+
+    for raw in URL_RE.findall(text or ""):
+        url = normalize_url(raw)
+        if url not in result:
+            result.append(url)
+
+    return result
+
+
+def shorten(text: str, length: int = 500) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+
+    if len(text) <= length:
+        return text
+
+    return text[: length - 1] + "…"
+
+
+def normalize_features(features: dict) -> dict:
     return {
-        "id": char_id,
-        "name": name,
-        "smell": smell,
-        "parents": unique_parents,
-        "combat_skills": combat_skills,
-        "game_hours": game_hours,
+        k: bool(v)
+        for k, v in sorted(features.items())
+        if isinstance(v, bool)
     }
 
-async def fetch_page(session: aiohttp.ClientSession, char_id: int, max_retries: int = 2) -> str | None:
-    """Загрузка страницы с повторными попытками."""
-    url = f"https://stats.worldcats.ru/p/{char_id}"
-    timeout = aiohttp.ClientTimeout(total=10.0)
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            async with session.get(url, timeout=timeout) as response:
-                if response.status == 200:
-                    return await response.text()
-                elif response.status in (404, 403):
-                    return None
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            pass
-        
-        if attempt < max_retries:
-            await asyncio.sleep(1.0)
+def source_message_link(
+    chat_id: int,
+    message_id: int,
+) -> Optional[str]:
+    chat_string = str(chat_id)
+
+    if chat_string.startswith("-100"):
+        internal_id = chat_string[4:]
+        return (
+            f"https://t.me/c/{internal_id}/{message_id}"
+        )
 
     return None
 
-def get_reply_keyboard(is_paused: bool = False) -> ReplyKeyboardMarkup:
-    """Клавиатура управления парсингом."""
-    pause_btn_text = "▶️ Продолжить" if is_paused else "⏸ Пауза"
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text=pause_btn_text),
-                KeyboardButton(text="📥 Промежуточный результат"),
-                KeyboardButton(text="⏹ Остановить")
-            ]
-        ],
-        resize_keyboard=True
-    )
 
-def build_children_map(characters_data: dict) -> dict:
-    """Карта детей для каждого родителя."""
-    children_map = {}
-    for char_id, char_info in characters_data.items():
-        for parent_id in char_info["parents"].keys():
-            if parent_id not in children_map:
-                children_map[parent_id] = []
-            children_map[parent_id].append({
-                "id": char_id,
-                "name": char_info["name"]
-            })
-    return children_map
+def get_telegram_target(
+    url: str,
+):
+    if not is_telegram_url(url):
+        return None
 
-def generate_txt_report(state: dict, is_interim: bool = False) -> BufferedInputFile:
-    """Генерация .txt отчета (итогового или промежуточного)."""
-    start_id = state["start_id"]
-    end_id = state["end_id"]
-    current_id = state["current_id"]
-    characters_data = state["characters_data"]
-    failed_ids = state["failed_ids"]
-    smell_counts = state["smell_counts"]
+    parsed = urlparse(url)
+    path = parsed.path.strip("/")
 
-    report = []
-    report.append("══════════════════════════════════════════════════")
-    if is_interim:
-        report.append(f"   ПРОМЕЖУТОЧНЫЙ ОТЧЕТ [Текущий ID: {current_id} | Диапазон: {start_id} - {end_id}]")
-    else:
-        report.append(f"   ОТЧЕТ ПАРСИНГА ДИАПАЗОНА [{start_id} - {end_id}]")
-    report.append("══════════════════════════════════════════════════\n")
-    
-    # 1. Количество ошибок
-    report.append(f"Всего обработано персонажей: {len(characters_data)}")
-    report.append(f"Всего ID с ошибкой/пропущенных: {len(failed_ids)}\n")
+    if not path:
+        return None
 
-    # 2. Топ племен по количеству ID
-    report.append("--- ТОП ПЛЕМЕН (ЗАПАХОВ) ПО КОЛИЧЕСТВУ ПЕРСОНАЖЕЙ ---")
-    if smell_counts:
-        sorted_smells = sorted(smell_counts.items(), key=lambda x: x[1], reverse=True)
-        for idx, (smell_name, count) in enumerate(sorted_smells, 1):
-            report.append(f"{idx}. {smell_name}: {count} перс.")
-    else:
-        report.append("Данные отсутствуют.")
-    report.append("\n")
+    parts = path.split("/")
 
-    # 3. Топ 100 по боевым умениям
-    report.append("--- ТОП-100 ПО БОЕВЫМ УМЕНИЯМ ---")
-    sorted_by_combat = sorted(
-        characters_data.values(),
-        key=lambda x: x.get("combat_skills", 0),
-        reverse=True
-    )[:100]
+    if len(parts) >= 3 and parts[0].lower() == "s":
+        username = parts[1]
+        message_id = (
+            int(parts[2]) if parts[2].isdigit() else None
+        )
+        return username, message_id
 
-    if sorted_by_combat and any(c.get("combat_skills", 0) > 0 for c in sorted_by_combat):
-        for idx, c in enumerate(sorted_by_combat, 1):
-            report.append(f"{idx}. ID {c['id']} - {c['name']} ({c['smell']}) — {c['combat_skills']} ед.")
-    else:
-        report.append("Нет данных или у всех персонажей 0 ед.")
-    report.append("\n")
+    if len(parts) >= 2:
+        username = parts[0]
+        message_id = (
+            int(parts[1]) if parts[1].isdigit() else None
+        )
+        return username, message_id
 
-    # 4. Топ 100 по часам в игре
-    report.append("--- ТОП-100 ПО ВРЕМЕНИ В ИГРЕ ---")
-    sorted_by_hours = sorted(
-        characters_data.values(),
-        key=lambda x: x.get("game_hours", 0.0),
-        reverse=True
-    )[:100]
+    return parts[0], None
 
-    if sorted_by_hours and any(c.get("game_hours", 0.0) > 0 for c in sorted_by_hours):
-        for idx, c in enumerate(sorted_by_hours, 1):
-            report.append(f"{idx}. ID {c['id']} - {c['name']} ({c['smell']}) — {c['game_hours']} ч.")
-    else:
-        report.append("Нет данных или у всех персонажей 0 ч.")
-    report.append("\n")
 
-    file_bytes = "\n".join(report).encode('utf-8')
-    prefix = "interim_report" if is_interim else "report"
-    return BufferedInputFile(file_bytes, filename=f"{prefix}_{start_id}_{end_id}.txt")
+# ============================================================
+# DATABASE
+# ============================================================
 
-def generate_excel_report(state: dict, is_interim: bool = False) -> BufferedInputFile:
-    """Генерация Excel файла: ID - Имя - Запах племени - Родители - Дети."""
-    start_id = state["start_id"]
-    end_id = state["end_id"]
-    characters_data = state["characters_data"]
-    children_map = build_children_map(characters_data)
+class Database:
+    def __init__(self, path: str):
+        self.path = path
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Персонажи"
-    ws.views.sheetView[0].showGridLines = True
+    async def init(self):
+        directory = os.path.dirname(self.path)
 
-    # Стилизация Excel
-    font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    font_data = Font(name="Calibri", size=11, color="000000")
-    fill_header = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
-    fill_zebra = PatternFill(start_color="F2F5F9", end_color="F2F5F9", fill_type="solid")
-    fill_white = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
-    
-    thin_border = Border(
-        left=Side(style='thin', color='D9D9D9'),
-        right=Side(style='thin', color='D9D9D9'),
-        top=Side(style='thin', color='D9D9D9'),
-        bottom=Side(style='thin', color='D9D9D9')
-    )
+        if directory:
+            os.makedirs(directory, exist_ok=True)
 
-    headers = ["айди", "Имя", "запах племени", "Родители", "Дети"]
-    
-    for col_idx, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font = font_header
-        cell.fill = fill_header
-        cell.alignment = Alignment(horizontal='center', vertical='center')
-        cell.border = thin_border
-    ws.row_dimensions[1].height = 25
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_chat_id INTEGER,
+                    source_message_id INTEGER,
+                    submitted_by INTEGER,
+                    original_url TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    confidence REAL NOT NULL,
+                    reasons TEXT,
+                    rules TEXT,
+                    features TEXT,
+                    chain TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
 
-    row_idx = 2
-    for char_id in sorted(characters_data.keys()):
-        char_info = characters_data[char_id]
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_id INTEGER NOT NULL,
+                    moderator_id INTEGER NOT NULL,
+                    rating TEXT NOT NULL,
+                    corrected_verdict TEXT,
+                    comment TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(scan_id, moderator_id)
+                )
+            """)
 
-        # Строка родителей
-        parents = char_info["parents"]
-        if parents:
-            parents_str = ", ".join([f"{p_name} (ID: {p_id})" for p_id, p_name in parents.items()])
-        else:
-            parents_str = "—"
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS verified_cases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT NOT NULL,
+                    resource_type TEXT NOT NULL,
+                    features TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    rules TEXT,
+                    confidence REAL NOT NULL,
+                    confirmations INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(fingerprint, verdict)
+                )
+            """)
 
-        # Строка детей
-        children = children_map.get(char_id, [])
-        if children:
-            children_str = ", ".join([f"{c['name']} (ID: {c['id']})" for c in children])
-        else:
-            children_str = "—"
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS resources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE NOT NULL,
+                    resource_type TEXT,
+                    features TEXT,
+                    verdict TEXT,
+                    score INTEGER,
+                    verified INTEGER DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+            """)
 
-        row_values = [
-            char_id,
-            char_info["name"],
-            char_info["smell"],
-            parents_str,
-            children_str
-        ]
+            await db.commit()
 
-        row_fill = fill_zebra if row_idx % 2 == 0 else fill_white
-        for col_idx, val in enumerate(row_values, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.font = font_data
-            cell.fill = row_fill
-            cell.border = thin_border
-            if col_idx == 1:
-                cell.alignment = Alignment(horizontal='center', vertical='center')
+    async def create_scan(
+        self,
+        *,
+        source_chat_id: int,
+        source_message_id: int,
+        submitted_by: int,
+        original_url: str,
+        result: Classification,
+        chain: list[str],
+    ) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO scans (
+                    source_chat_id,
+                    source_message_id,
+                    submitted_by,
+                    original_url,
+                    verdict,
+                    score,
+                    confidence,
+                    reasons,
+                    rules,
+                    features,
+                    chain,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_chat_id,
+                    source_message_id,
+                    submitted_by,
+                    original_url,
+                    result.verdict,
+                    result.score,
+                    result.confidence,
+                    json.dumps(result.reasons, ensure_ascii=False),
+                    json.dumps(result.rules, ensure_ascii=False),
+                    json.dumps(result.features, ensure_ascii=False),
+                    json.dumps(chain, ensure_ascii=False),
+                    utc_now(),
+                ),
+            )
+
+            await db.commit()
+            return cursor.lastrowid
+
+    async def add_feedback(
+        self,
+        scan_id: int,
+        moderator_id: int,
+        rating: str,
+        corrected_verdict: Optional[str] = None,
+        comment: Optional[str] = None,
+    ):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO feedback (
+                    scan_id,
+                    moderator_id,
+                    rating,
+                    corrected_verdict,
+                    comment,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scan_id,
+                    moderator_id,
+                    rating,
+                    corrected_verdict,
+                    comment,
+                    utc_now(),
+                ),
+            )
+            await db.commit()
+
+    async def get_scan(self, scan_id: int):
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute(
+                "SELECT * FROM scans WHERE id = ?",
+                (scan_id,),
+            )
+
+            return await cursor.fetchone()
+
+    async def save_verified_case(
+        self,
+        features: dict,
+        verdict: str,
+        rules: list[str],
+        resource_type: str,
+    ):
+        normalized = json.dumps(
+            normalize_features(features),
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+
+        fingerprint = hashlib.sha256(
+            normalized.encode("utf-8")
+        ).hexdigest()
+
+        now = utc_now()
+
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                SELECT id
+                FROM verified_cases
+                WHERE fingerprint = ?
+                  AND verdict = ?
+                """,
+                (
+                    fingerprint,
+                    verdict,
+                ),
+            )
+
+            existing = await cursor.fetchone()
+
+            if existing:
+                await db.execute(
+                    """
+                    UPDATE verified_cases
+                    SET confirmations = confirmations + 1,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        now,
+                        existing[0],
+                    ),
+                )
             else:
-                cell.alignment = Alignment(horizontal='left', vertical='center')
+                await db.execute(
+                    """
+                    INSERT INTO verified_cases (
+                        fingerprint,
+                        resource_type,
+                        features,
+                        verdict,
+                        rules,
+                        confidence,
+                        confirmations,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        fingerprint,
+                        resource_type,
+                        json.dumps(
+                            features,
+                            ensure_ascii=False,
+                        ),
+                        verdict,
+                        json.dumps(
+                            rules,
+                            ensure_ascii=False,
+                        ),
+                        1.0,
+                        1,
+                        now,
+                        now,
+                    ),
+                )
 
-        ws.row_dimensions[row_idx].height = 20
-        row_idx += 1
+            await db.commit()
 
-    # Подгонка ширины столбцов
-    for col in ws.columns:
-        max_len = 0
-        col_letter = get_column_letter(col[0].column)
-        for cell in col:
-            val_str = str(cell.value or '')
-            if len(val_str) > max_len:
-                max_len = len(val_str)
-        ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
+    async def get_verified_cases(
+        self,
+        limit: int = 500,
+    ):
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
 
-    stream = io.BytesIO()
-    wb.save(stream)
-    stream.seek(0)
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM verified_cases
+                WHERE confirmations >= 2
+                ORDER BY confirmations DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
 
-    prefix = "interim_characters" if is_interim else "characters"
-    return BufferedInputFile(stream.read(), filename=f"{prefix}_{start_id}_{end_id}.xlsx")
+            return await cursor.fetchall()
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+    async def stats(self):
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN verdict = 'PERSONAL'
+                        THEN 1 ELSE 0 END) AS personal,
+                    SUM(CASE WHEN verdict = 'WORK'
+                        THEN 1 ELSE 0 END) AS work,
+                    SUM(CASE WHEN verdict = 'SUSPICIOUS'
+                        THEN 1 ELSE 0 END) AS suspicious,
+                    SUM(CASE WHEN verdict = 'UNKNOWN'
+                        THEN 1 ELSE 0 END) AS unknown
+                FROM scans
+                """
+            )
 
-async def run_parser_task(chat_id: int, start_id: int, end_id: int, batch_size: int = 100):
-    state = active_tasks[chat_id]
-    total_ids = end_id - start_id + 1
+            scans = await cursor.fetchone()
 
-    await bot.send_message(
-        chat_id,
-        f"🚀 **Запуск парсинга диапазонов {start_id} – {end_id}** (всего ID: {total_ids})",
-        parse_mode="Markdown",
-        reply_markup=get_reply_keyboard()
+            cursor = await db.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN rating = 'correct'
+                        THEN 1 ELSE 0 END) AS correct,
+                    SUM(CASE WHEN rating = 'partial'
+                        THEN 1 ELSE 0 END) AS partial,
+                    SUM(CASE WHEN rating = 'wrong'
+                        THEN 1 ELSE 0 END) AS wrong
+                FROM feedback
+                """
+            )
+
+            feedback = await cursor.fetchone()
+
+            return scans, feedback
+
+
+db = Database(DB_PATH)
+
+
+# ============================================================
+# HTTP
+# ============================================================
+
+class HttpClient:
+    def __init__(self):
+        timeout = aiohttp.ClientTimeout(
+            total=REQUEST_TIMEOUT
+        )
+
+        self.session = aiohttp.ClientSession(
+            timeout=timeout,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            },
+        )
+
+    async def close(self):
+        await self.session.close()
+
+    async def get(self, url: str):
+        return await self.session.get(
+            url,
+            allow_redirects=True,
+        )
+
+
+http: Optional[HttpClient] = None
+
+
+# ============================================================
+# WEB PARSER
+# ============================================================
+
+async def fetch_web_page(
+    url: str,
+) -> ResourceNode:
+    node = ResourceNode(
+        url=url,
+        depth=0,
+        telegram=is_telegram_url(url),
     )
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
+    try:
+        async with await http.get(url) as response:
+            node.final_url = str(response.url)
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        current_id = state["current_id"]
+            content_type = response.headers.get(
+                "Content-Type",
+                "",
+            ).lower()
 
-        while current_id <= end_id and state["is_running"]:
-            if state["jump_to_id"] is not None:
-                current_id = state["jump_to_id"]
-                state["jump_to_id"] = None
-                if current_id > end_id:
-                    break
+            if "text/html" not in content_type:
+                return node
 
-            while state["is_paused"] and state["is_running"]:
-                await asyncio.sleep(1.0)
-                if not state["is_running"]:
-                    break
+            raw = await response.text(
+                errors="ignore"
+            )
 
-            if not state["is_running"]:
-                break
+    except Exception as exc:
+        node.accessible = False
+        node.error = (
+            f"{type(exc).__name__}: {exc}"
+        )
+        return node
 
-            current_batch_end = min(current_id + batch_size - 1, end_id)
-            batch_failed_ids = []
+    soup = BeautifulSoup(raw, "lxml")
 
-            for cid in range(current_id, current_batch_end + 1):
-                if state["jump_to_id"] is not None or not state["is_running"]:
-                    break
+    title = soup.find("title")
 
-                while state["is_paused"] and state["is_running"]:
-                    await asyncio.sleep(1.0)
+    if title:
+        node.title = shorten(
+            title.get_text(" ", strip=True),
+            300,
+        )
 
-                if not state["is_running"]:
-                    break
+    for tag in soup(
+        ["script", "style", "noscript", "svg"]
+    ):
+        tag.decompose()
 
-                state["current_id"] = cid
-                html_content = await fetch_page(session, cid, max_retries=2)
-                
-                if html_content:
-                    try:
-                        data = parse_character_data(html_content, cid)
-                        state["characters_data"][cid] = data
-                        
-                        smell = data["smell"]
-                        state["smell_counts"][smell] = state["smell_counts"].get(smell, 0) + 1
-                    except Exception as e:
-                        logging.error(f"❌ Ошибка разбора ID {cid}: {e}")
-                        state["failed_ids"].append(cid)
-                        batch_failed_ids.append(cid)
-                else:
-                    logging.warning(f"⚠️ ID {cid} не загрузился или не существует")
-                    state["failed_ids"].append(cid)
-                    batch_failed_ids.append(cid)
+    node.text = shorten(
+        soup.get_text(" ", strip=True),
+        30000,
+    )
 
-                await asyncio.sleep(random.uniform(0.3, 0.6))
+    links = set()
 
-            if state["jump_to_id"] is not None:
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+
+        if href.startswith(
+            (
+                "javascript:",
+                "mailto:",
+                "tel:",
+                "#",
+            )
+        ):
+            continue
+
+        absolute = urljoin(
+            node.final_url or url,
+            href,
+        )
+
+        if absolute.startswith(
+            ("http://", "https://")
+        ):
+            links.add(
+                normalize_url(absolute)
+            )
+
+    node.links = list(links)
+
+    return node
+
+
+# ============================================================
+# TELEGRAM PUBLIC PARSER
+# ============================================================
+
+async def fetch_telegram_resource(
+    url: str,
+) -> ResourceNode:
+    node = ResourceNode(
+        url=url,
+        depth=0,
+        telegram=True,
+    )
+
+    target = get_telegram_target(url)
+
+    if not target:
+        node.accessible = False
+        node.error = "Invalid Telegram URL"
+        return node
+
+    username, message_id = target
+
+    public_url = f"https://t.me/s/{username}"
+
+    try:
+        async with await http.get(
+            public_url
+        ) as response:
+
+            node.final_url = str(response.url)
+
+            if response.status != 200:
+                node.accessible = False
+                node.error = (
+                    f"HTTP {response.status}"
+                )
+                return node
+
+            raw = await response.text(
+                errors="ignore"
+            )
+
+    except Exception as exc:
+        node.accessible = False
+        node.error = (
+            f"{type(exc).__name__}: {exc}"
+        )
+        return node
+
+    soup = BeautifulSoup(
+        raw,
+        "lxml",
+    )
+
+    posts = soup.select(
+        ".tgme_widget_message"
+    )
+
+    texts = []
+    links = set()
+
+    for post in posts[:MAX_TELEGRAM_POSTS]:
+        text_node = post.select_one(
+            ".tgme_widget_message_text"
+        )
+
+        if text_node:
+            texts.append(
+                text_node.get_text(
+                    " ",
+                    strip=True,
+                )
+            )
+
+        for a in post.find_all(
+            "a",
+            href=True,
+        ):
+            href = (a.get("href") or "").strip()
+
+            if href.startswith(
+                ("http://", "https://")
+            ):
+                links.add(
+                    normalize_url(href)
+                )
+
+    node.text = "\n".join(texts)[:50000]
+    node.links = list(links)
+
+    # Try to inspect the exact public post too.
+    if message_id:
+        specific_url = (
+            f"https://t.me/{username}/{message_id}"
+        )
+
+        try:
+            async with await http.get(
+                specific_url
+            ) as response:
+
+                if response.status == 200:
+                    raw_specific = (
+                        await response.text(
+                            errors="ignore"
+                        )
+                    )
+
+                    specific_soup = BeautifulSoup(
+                        raw_specific,
+                        "lxml",
+                    )
+
+                    for post in specific_soup.select(
+                        ".tgme_widget_message"
+                    ):
+
+                        text_node = post.select_one(
+                            ".tgme_widget_message_text"
+                        )
+
+                        if text_node:
+                            node.text += (
+                                "\n"
+                                + text_node.get_text(
+                                    " ",
+                                    strip=True,
+                                )
+                            )
+
+                        for a in post.find_all(
+                            "a",
+                            href=True,
+                        ):
+                            href = (
+                                a.get("href")
+                                or ""
+                            )
+
+                            if href.startswith(
+                                (
+                                    "http://",
+                                    "https://",
+                                )
+                            ):
+                                node.links.append(
+                                    normalize_url(href)
+                                )
+
+        except Exception:
+            pass
+
+    node.links = list(
+        dict.fromkeys(node.links)
+    )
+
+    return node
+
+
+# ============================================================
+# RECURSIVE CRAWLER
+# ============================================================
+
+async def crawl(
+    start_url: str,
+) -> list[ResourceNode]:
+
+    start_url = normalize_url(
+        start_url
+    )
+
+    visited = set()
+    queue = [
+        (
+            start_url,
+            0,
+            None,
+        )
+    ]
+
+    nodes = []
+
+    while queue:
+        url, depth, parent = queue.pop(0)
+
+        if url in visited:
+            continue
+
+        if depth > MAX_DEPTH:
+            continue
+
+        if len(nodes) >= MAX_RESOURCES:
+            break
+
+        visited.add(url)
+
+        if is_telegram_url(url):
+            node = await fetch_telegram_resource(
+                url
+            )
+        else:
+            node = await fetch_web_page(
+                url
+            )
+
+        node.depth = depth
+        node.parent = parent
+
+        nodes.append(node)
+
+        for link in node.links:
+            if link in visited:
                 continue
 
-            if not state["is_running"]:
-                break
-
-            processed_count = len(state["characters_data"]) + len(state["failed_ids"])
-            progress_percent = min(100, int((processed_count / total_ids) * 100))
-
-            report_batch_text = (
-                f"📊 **Промежуточный отчёт**\n"
-                f"Обработан пакет: `id{current_id}` — `id{current_batch_end}`\n"
-                f"Прогресс: `{processed_count}/{total_ids}` ({progress_percent}%)\n"
-                f"Ошибок в пакете: {len(batch_failed_ids)}"
-            )
-            
-            await bot.send_message(
-                chat_id,
-                report_batch_text,
-                parse_mode="Markdown"
+            queue.append(
+                (
+                    link,
+                    depth + 1,
+                    url,
+                )
             )
 
-            current_id = current_batch_end + 1
+    return nodes
 
-    # Формируем итоговые файлы
-    txt_file = generate_txt_report(state, is_interim=False)
-    excel_file = generate_excel_report(state, is_interim=False)
-    status_caption = "⏹ Парсинг остановлен пользователем!" if not state["is_running"] else "✅ Парсинг завершён!"
 
-    # Отправляем TXT и Excel файлы
-    await bot.send_document(
-        chat_id,
-        txt_file,
-        caption=f"{status_caption}\nТекстовый отчёт (диапазон: `id{start_id}` — `id{end_id}`).",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+# ============================================================
+# FEATURES
+# ============================================================
+
+PATTERNS = {
+    "personal_posts": [
+        r"\bщитпост\b",
+        r"\bщит ?пост\b",
+        r"\bличный пост\b",
+        r"\bличное\b",
+        r"\bличный контент\b",
+        r"\bповседневн",
+        r"\bмоя жизнь\b",
+        r"\bиз жизни\b",
+    ],
+
+    "work_in_progress": [
+        r"\bwip\b",
+        r"\bw\.i\.p\b",
+        r"\bстадия работы\b",
+        r"\bстадия рисунка\b",
+        r"\bпроцесс работы\b",
+        r"\bпроцесс рисования\b",
+        r"\bпроцесс\b",
+        r"\bскетч\b",
+        r"\bэскиз\b",
+    ],
+
+    "reposts": [
+        r"\bрепост\b",
+        r"\brepost\b",
+        r"\bперерепост\b",
+    ],
+
+    "self_promotion": [
+        r"\bмой канал\b",
+        r"\bмоя группа\b",
+        r"\bмой тг\b",
+        r"\bмой телеграм\b",
+        r"\bподпишись\b",
+        r"\bподписывайся\b",
+        r"\bподписывайтесь\b",
+    ],
+
+    "spoilers": [
+        r"\bспойлер\b",
+        r"\bспойлеры\b",
+    ],
+
+    "portfolio": [
+        r"\bпортфолио\b",
+        r"\bportfolio\b",
+        r"\bмои работы\b",
+        r"\bпримеры работ\b",
+    ],
+
+    "prices": [
+        r"\bцена\b",
+        r"\bцены\b",
+        r"\bпрайс\b",
+        r"\bстоимость\b",
+        r"\bпрайслист\b",
+    ],
+
+    "commissions": [
+        r"\bкоммиш",
+        r"\bкомиссион",
+        r"\bcommission",
+        r"\bзаказ\b",
+        r"\bзаказы\b",
+        r"\bзаказать\b",
+    ],
+
+    "contacts": [
+        r"\bконтакт\b",
+        r"\bконтакты\b",
+        r"\bсвязаться\b",
+        r"\bдля связи\b",
+        r"\btelegram\b",
+        r"\bтелеграм\b",
+        r"\bтг\b",
+    ],
+
+    "personal_photos": [
+        r"\bселфи\b",
+        r"\bфото с собой\b",
+        r"\bмоя фотка\b",
+        r"\bмоя фотография\b",
+    ],
+}
+
+
+def detect_features(
+    nodes: list[ResourceNode],
+) -> dict:
+
+    texts = [
+        node.text
+        for node in nodes
+        if node.text
+    ]
+
+    combined = "\n".join(texts).lower()
+
+    features = {}
+
+    for feature, patterns in PATTERNS.items():
+        features[feature] = any(
+            re.search(
+                pattern,
+                combined,
+                re.IGNORECASE,
+            )
+            for pattern in patterns
+        )
+
+    features["has_telegram"] = any(
+        node.telegram
+        for node in nodes
     )
 
-    await bot.send_document(
-        chat_id,
-        excel_file,
-        caption=f"📊 Таблица Excel с персонажами.",
-        parse_mode="Markdown"
+    features["has_nested_telegram"] = any(
+        node.telegram and node.depth > 0
+        for node in nodes
     )
 
-    active_tasks.pop(chat_id, None)
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    welcome_text = (
-        "👋 **Привет! Я бот-парсер персонажей worldcats.ru**\n\n"
-        "📌 **Управление парсингом:**\n"
-        "• `/parse [старт_id] [конец_id]` — запустить парсинг\n"
-        "• `/resume [id]` — вернуться/перейти к конкретному ID без потери прогресса\n\n"
-        "По завершении бот отправит `.txt` с топами и отчётом, а также файл `.xlsx`."
+    features["has_external_links"] = any(
+        node.links
+        for node in nodes
     )
-    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
-@dp.message(Command("parse"))
-async def cmd_parse(message: types.Message):
-    chat_id = message.chat.id
+    features["has_work_signals"] = any(
+        features.get(name, False)
+        for name in (
+            "portfolio",
+            "prices",
+            "commissions",
+            "contacts",
+        )
+    )
 
-    if chat_id in active_tasks and active_tasks[chat_id]["is_running"]:
-        await message.answer("⚠️ У вас уже запущен парсинг! Используйте кнопки клавиатуры внизу.")
+    return features
+
+
+# ============================================================
+# LEARNING
+# ============================================================
+
+async def apply_verified_cases(
+    features: dict,
+) -> Optional[tuple[str, float]]:
+
+    cases = await db.get_verified_cases()
+
+    if not cases:
+        return None
+
+    current = normalize_features(
+        features
+    )
+
+    best_verdict = None
+    best_similarity = 0.0
+
+    for case in cases:
+        try:
+            case_features = json.loads(
+                case["features"]
+            )
+        except Exception:
+            continue
+
+        case_features = normalize_features(
+            case_features
+        )
+
+        keys = set(current) | set(case_features)
+
+        if not keys:
+            continue
+
+        matches = sum(
+            current.get(k, False)
+            == case_features.get(k, False)
+            for k in keys
+        )
+
+        similarity = matches / len(keys)
+
+        weighted = similarity * (
+            1.0
+            + min(case["confirmations"], 10)
+            * 0.02
+        )
+
+        if weighted > best_similarity:
+            best_similarity = weighted
+            best_verdict = case["verdict"]
+
+    if (
+        best_verdict
+        and best_similarity >= 0.88
+    ):
+        return (
+            best_verdict,
+            min(0.99, best_similarity),
+        )
+
+    return None
+
+
+# ============================================================
+# CLASSIFIER
+# ============================================================
+
+async def classify(
+    nodes: list[ResourceNode],
+) -> Classification:
+
+    features = detect_features(nodes)
+
+    score = 0
+    reasons = []
+    rules = []
+
+    def add(
+        points: int,
+        reason: str,
+        rule: str,
+    ):
+        nonlocal score
+
+        score += points
+        reasons.append(reason)
+        rules.append(rule)
+
+    if features["personal_posts"]:
+        add(
+            28,
+            "обнаружены личные посты",
+            "8.1.1",
+        )
+
+    if features["work_in_progress"]:
+        add(
+            18,
+            "обнаружены стадии работ / WIP",
+            "8.1.1",
+        )
+
+    if features["reposts"]:
+        add(
+            12,
+            "обнаружены репосты",
+            "8.1.1",
+        )
+
+    if features["self_promotion"]:
+        add(
+            12,
+            "обнаружен личный самопиар",
+            "8.1.1",
+        )
+
+    if features["spoilers"]:
+        add(
+            10,
+            "обнаружены спойлеры",
+            "8.1.1",
+        )
+
+    if features["personal_photos"]:
+        add(
+            18,
+            "обнаружен личный фотоконтент",
+            "8.1.1",
+        )
+
+    if features["has_nested_telegram"]:
+        add(
+            25,
+            "обнаружен Telegram-ресурс "
+            "в цепочке переходов",
+            "8.2.1",
+        )
+
+    work_signals = sum(
+        bool(features.get(x))
+        for x in (
+            "portfolio",
+            "prices",
+            "commissions",
+            "contacts",
+        )
+    )
+
+    if work_signals >= 2:
+        score -= 10
+
+    verified = await apply_verified_cases(
+        features
+    )
+
+    confidence = min(
+        0.98,
+        0.50 + score / 200,
+    )
+
+    if verified:
+        verified_verdict, verified_conf = verified
+
+        if verified_conf >= 0.92:
+            if verified_verdict == "PERSONAL":
+                score = max(score, 70)
+            elif verified_verdict == "WORK":
+                score = min(score, 40)
+
+            confidence = max(
+                confidence,
+                verified_conf,
+            )
+
+    score = max(
+        0,
+        min(100, score),
+    )
+
+    if score >= 70:
+        verdict = "PERSONAL"
+    elif score >= MIN_ALERT_SCORE:
+        verdict = "SUSPICIOUS"
+    elif work_signals >= 2 and score < 45:
+        verdict = "WORK"
+    elif score < 45:
+        verdict = "WORK"
+    else:
+        verdict = "UNKNOWN"
+
+    accessible = [
+        node
+        for node in nodes
+        if node.accessible
+        and (node.text or node.links)
+    ]
+
+    if not accessible:
+        verdict = "UNKNOWN"
+        confidence = 0.15
+        reasons = [
+            "содержимое ресурса недоступно "
+            "для автоматической проверки"
+        ]
+        rules = []
+
+    if not reasons:
+        reasons = [
+            "явных признаков личного ресурса "
+            "не обнаружено"
+        ]
+
+    telegram_resources = [
+        node.url
+        for node in nodes
+        if node.telegram
+    ]
+
+    return Classification(
+        verdict=verdict,
+        score=score,
+        confidence=confidence,
+        reasons=list(dict.fromkeys(reasons)),
+        rules=list(dict.fromkeys(rules)),
+        features=features,
+        telegram_resources=telegram_resources,
+    )
+
+
+# ============================================================
+# REPORT
+# ============================================================
+
+def build_report(
+    scan_id: int,
+    result: Classification,
+    original_url: str,
+    nodes: list[ResourceNode],
+    source_link: Optional[str],
+) -> str:
+
+    report = (
+        "🚨 <b>ПРОВЕРКА РЕСУРСА</b>\n\n"
+        f"<b>Вердикт:</b> "
+        f"{VERDICTS[result.verdict]}\n"
+        f"<b>Оценка риска:</b> "
+        f"{result.score}/100\n"
+        f"<b>Уверенность:</b> "
+        f"{round(result.confidence * 100)}%\n\n"
+        f"<b>Исходная ссылка:</b>\n"
+        f'<a href="{html.escape(original_url)}">'
+        f"{html.escape(shorten(original_url, 300))}"
+        f"</a>\n"
+    )
+
+    if source_link:
+        report += (
+            "\n<b>Исходное сообщение:</b>\n"
+            f'<a href="{source_link}">'
+            "Открыть сообщение"
+            "</a>\n"
+        )
+
+    report += "\n<b>Причины:</b>\n"
+
+    for reason in result.reasons:
+        report += (
+            f"• {html.escape(reason)}\n"
+        )
+
+    if result.rules:
+        report += (
+            "\n<b>Связанные статьи:</b>\n"
+        )
+
+        for rule in result.rules:
+            report += f"• {rule}\n"
+
+    report += (
+        "\n<b>Обход:</b>\n"
+        f"• Ресурсов: {len(nodes)}\n"
+        f"• Telegram: "
+        f"{len(result.telegram_resources)}\n"
+        f"• Максимальная глубина: "
+        f"{MAX_DEPTH}\n"
+    )
+
+    if result.telegram_resources:
+        report += (
+            "\n<b>Telegram-ресурсы:</b>\n"
+        )
+
+        for url in result.telegram_resources[:10]:
+            report += (
+                f'• <a href="{html.escape(url)}">'
+                f"{html.escape(shorten(url, 180))}"
+                "</a>\n"
+            )
+
+    report += (
+        "\n"
+        f"<code>SCAN #{scan_id}</code>"
+    )
+
+    return report
+
+
+def feedback_keyboard(
+    scan_id: int,
+):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Верно",
+                    callback_data=(
+                        f"feedback:{scan_id}:correct"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="⚠️ Частично",
+                    callback_data=(
+                        f"feedback:{scan_id}:partial"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="❌ Ошибка",
+                    callback_data=(
+                        f"feedback:{scan_id}:wrong"
+                    ),
+                ),
+            ],
+        ]
+    )
+
+
+def correction_keyboard(
+    scan_id: int,
+):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🟢 Рабочий",
+                    callback_data=(
+                        f"correct:{scan_id}:WORK"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="🔴 Личный",
+                    callback_data=(
+                        f"correct:{scan_id}:PERSONAL"
+                    ),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🟠 Подозрительный",
+                    callback_data=(
+                        f"correct:{scan_id}:SUSPICIOUS"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="⚪ Неизвестно",
+                    callback_data=(
+                        f"correct:{scan_id}:UNKNOWN"
+                    ),
+                ),
+            ],
+        ]
+    )
+
+
+# ============================================================
+# BOT HANDLERS
+# ============================================================
+
+router = Router()
+
+
+def is_mod(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+async def process_url(
+    message: Message,
+    url: str,
+):
+
+    started = time.monotonic()
+
+    await message.reply(
+        "🔎 Проверяю ссылку и связанные ресурсы…"
+    )
+
+    try:
+        nodes = await crawl(url)
+        result = await classify(nodes)
+
+    except Exception:
+        log.exception("Analysis failed")
+
+        await message.reply(
+            "❌ Во время проверки произошла ошибка."
+        )
+
         return
 
-    args = message.text.split()
-    if len(args) < 3:
-        await message.answer("Укажите старт и конец диапазона.\nПример: `/parse 1 500`", parse_mode="Markdown")
+    elapsed = round(
+        time.monotonic() - started,
+        2,
+    )
+
+    source_link = source_message_link(
+        message.chat.id,
+        message.message_id,
+    )
+
+    scan_id = await db.create_scan(
+        source_chat_id=message.chat.id,
+        source_message_id=message.message_id,
+        submitted_by=(
+            message.from_user.id
+            if message.from_user
+            else 0
+        ),
+        original_url=url,
+        result=result,
+        chain=[
+            node.url
+            for node in nodes
+        ],
+    )
+
+    # Store resource information.
+    async with aiosqlite.connect(DB_PATH) as database:
+        now = utc_now()
+
+        for node in nodes:
+            await database.execute(
+                """
+                INSERT OR REPLACE INTO resources (
+                    url,
+                    resource_type,
+                    features,
+                    verdict,
+                    score,
+                    verified,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    node.url,
+                    "telegram" if node.telegram else "web",
+                    json.dumps(
+                        result.features,
+                        ensure_ascii=False,
+                    ),
+                    result.verdict,
+                    result.score,
+                    0,
+                    now,
+                ),
+            )
+
+        await database.commit()
+
+    if result.verdict == "WORK":
+        await message.reply(
+            "🟢 <b>Явных признаков личного "
+            "ресурса не обнаружено.</b>\n\n"
+            f"Уверенность: "
+            f"{round(result.confidence * 100)}%\n"
+            f"Проверено ресурсов: "
+            f"{len(nodes)}\n"
+            f"Время: {elapsed} сек."
+        )
+        return
+
+    report = build_report(
+        scan_id=scan_id,
+        result=result,
+        original_url=url,
+        nodes=nodes,
+        source_link=source_link,
+    )
+
+    if result.verdict == "UNKNOWN":
+        report = (
+            "🟠 <b>ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА</b>\n\n"
+            + report
+        )
+
+    await message.bot.send_message(
+        chat_id=MOD_CHAT_ID,
+        text=report,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=feedback_keyboard(scan_id),
+    )
+
+    await message.reply(
+        "⚠️ Результат отправлен модераторам "
+        "на проверку."
+    )
+
+
+@router.message(F.text)
+async def message_handler(
+    message: Message,
+):
+    urls = extract_urls(
+        message.text or ""
+    )
+
+    for url in urls[:5]:
+        await process_url(
+            message,
+            url,
+        )
+
+
+@router.message(F.caption)
+async def caption_handler(
+    message: Message,
+):
+    urls = extract_urls(
+        message.caption or ""
+    )
+
+    for url in urls[:5]:
+        await process_url(
+            message,
+            url,
+        )
+
+
+# ============================================================
+# FEEDBACK HANDLERS
+# ============================================================
+
+@router.callback_query(
+    F.data.startswith("feedback:")
+)
+async def feedback_handler(
+    callback: CallbackQuery,
+):
+
+    if not callback.message:
+        return
+
+    if callback.message.chat.id != MOD_CHAT_ID:
+        await callback.answer(
+            "Недоступно",
+            show_alert=True,
+        )
         return
 
     try:
-        start_id = int(args[1])
-        end_id = int(args[2])
-    except ValueError:
-        await message.answer("❌ ID должны быть целыми числами!")
+        _, scan_id, rating = (
+            callback.data.split(":")
+        )
+        scan_id = int(scan_id)
+    except Exception:
+        await callback.answer(
+            "Некорректная кнопка",
+            show_alert=True,
+        )
         return
 
-    if start_id > end_id:
-        await message.answer("❌ Стартовый ID не может быть больше конечного!")
+    scan = await db.get_scan(scan_id)
+
+    if not scan:
+        await callback.answer(
+            "Проверка не найдена",
+            show_alert=True,
+        )
         return
 
-    active_tasks[chat_id] = {
-        "is_running": True,
-        "is_paused": False,
-        "start_id": start_id,
-        "end_id": end_id,
-        "current_id": start_id,
-        "characters_data": {},
-        "failed_ids": [],
-        "smell_counts": {},
-        "jump_to_id": None
-    }
+    if rating == "correct":
 
-    asyncio.create_task(run_parser_task(chat_id, start_id, end_id))
+        await db.add_feedback(
+            scan_id,
+            callback.from_user.id,
+            "correct",
+        )
 
-@dp.message(Command("resume"))
-async def cmd_resume(message: types.Message):
-    chat_id = message.chat.id
+        try:
+            features = json.loads(
+                scan["features"] or "{}"
+            )
 
-    if chat_id not in active_tasks or not active_tasks[chat_id]["is_running"]:
-        await message.answer("❌ В данный момент у вас нет активного парсинга.")
+            rules = json.loads(
+                scan["rules"] or "[]"
+            )
+
+            await db.save_verified_case(
+                features=features,
+                verdict=scan["verdict"],
+                rules=rules,
+                resource_type=(
+                    "telegram"
+                    if "t.me/" in scan["original_url"]
+                    else "web"
+                ),
+            )
+
+        except Exception:
+            log.exception(
+                "Could not save verified case"
+            )
+
+        await callback.answer(
+            "Сохранено как подтверждённый кейс"
+        )
+
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=None
+            )
+        except Exception:
+            pass
+
+        await callback.message.answer(
+            f"#{scan_id}: "
+            "✅ результат подтверждён модератором."
+        )
+
         return
 
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Укажите ID, к которому нужно вернуться/перейти.\nПример: `/resume 450`", parse_mode="Markdown")
+    if rating in {"partial", "wrong"}:
+
+        await db.add_feedback(
+            scan_id,
+            callback.from_user.id,
+            rating,
+        )
+
+        await callback.answer(
+            "Выбери правильный вердикт"
+        )
+
+        await callback.message.answer(
+            f"Проверка #{scan_id}\n"
+            "Какой вердикт должен быть?",
+            reply_markup=correction_keyboard(
+                scan_id
+            ),
+        )
+
+
+@router.callback_query(
+    F.data.startswith("correct:")
+)
+async def correction_handler(
+    callback: CallbackQuery,
+):
+
+    if not callback.message:
+        return
+
+    if callback.message.chat.id != MOD_CHAT_ID:
+        await callback.answer(
+            "Недоступно",
+            show_alert=True,
+        )
         return
 
     try:
-        target_id = int(args[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть целым числом!")
+        _, scan_id, verdict = (
+            callback.data.split(":")
+        )
+        scan_id = int(scan_id)
+    except Exception:
+        await callback.answer(
+            "Некорректная кнопка",
+            show_alert=True,
+        )
         return
 
-    state = active_tasks[chat_id]
-    if target_id < state["start_id"] or target_id > state["end_id"]:
-        await message.answer(f"❌ Указанный ID вне рамок текущего диапазона ({state['start_id']} – {state['end_id']})!")
+    scan = await db.get_scan(scan_id)
+
+    if not scan:
+        await callback.answer(
+            "Проверка не найдена",
+            show_alert=True,
+        )
         return
 
-    state["jump_to_id"] = target_id
-    state["is_paused"] = False
-    await message.answer(f"🔄 Возвращаемся к парсингу с **ID {target_id}**...", parse_mode="Markdown", reply_markup=get_reply_keyboard(False))
-
-@dp.message(F.text.in_(["⏸ Пауза", "▶️ Продолжить"]))
-async def process_toggle_pause(message: types.Message):
-    chat_id = message.chat.id
-
-    if chat_id not in active_tasks or not active_tasks[chat_id]["is_running"]:
-        await message.answer("У вас нет активного парсинга.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    state = active_tasks[chat_id]
-    state["is_paused"] = not state["is_paused"]
-
-    status_text = "⏸ Парсинг поставлен на паузу" if state["is_paused"] else "▶️ Парсинг возобновлён"
-    await message.answer(status_text, reply_markup=get_reply_keyboard(state["is_paused"]))
-
-@dp.message(F.text == "📥 Промежуточный результат")
-async def process_send_interim_report(message: types.Message):
-    chat_id = message.chat.id
-
-    if chat_id not in active_tasks or not active_tasks[chat_id]["is_running"]:
-        await message.answer("У вас нет активного парсинга.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    state = active_tasks[chat_id]
-
-    if not state["characters_data"]:
-        await message.answer("⚠️ Ещё не собрано ни одной записи для отчёта.")
-        return
-
-    await message.answer("⏳ Формирую текущие промежуточные отчёты...")
-
-    # Генерация промежуточных файлов
-    txt_file = generate_txt_report(state, is_interim=True)
-    excel_file = generate_excel_report(state, is_interim=True)
-
-    current_id = state["current_id"]
-    total = state["end_id"] - state["start_id"] + 1
-
-    await bot.send_document(
-        chat_id,
-        txt_file,
-        caption=f"📥 **Промежуточный текстовый отчёт**\nСобрано к ID: `{current_id}` (из {total})",
-        parse_mode="Markdown"
+    await db.add_feedback(
+        scan_id=scan_id,
+        moderator_id=callback.from_user.id,
+        rating="wrong",
+        corrected_verdict=verdict,
     )
 
-    await bot.send_document(
-        chat_id,
-        excel_file,
-        caption=f"📊 **Промежуточная Excel таблица**",
-        parse_mode="Markdown"
+    try:
+        features = json.loads(
+            scan["features"] or "{}"
+        )
+
+        rules = json.loads(
+            scan["rules"] or "[]"
+        )
+
+        await db.save_verified_case(
+            features=features,
+            verdict=verdict,
+            rules=rules,
+            resource_type=(
+                "telegram"
+                if "t.me/" in scan["original_url"]
+                else "web"
+            ),
+        )
+
+    except Exception:
+        log.exception(
+            "Could not save corrected case"
+        )
+
+    await callback.answer(
+        "Исправление сохранено"
     )
 
-@dp.message(F.text == "⏹ Остановить")
-async def process_stop_parser(message: types.Message):
-    chat_id = message.chat.id
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=None
+        )
+    except Exception:
+        pass
 
-    if chat_id not in active_tasks or not active_tasks[chat_id]["is_running"]:
-        await message.answer("У вас нет активного парсинга.", reply_markup=ReplyKeyboardRemove())
+    await callback.message.answer(
+        f"#{scan_id}: исправлено на "
+        f"<b>{VERDICTS.get(verdict, verdict)}</b>.\n"
+        "Кейс сохранён для будущего анализа.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
+# COMMANDS
+# ============================================================
+
+@router.message(Command("stats"))
+async def stats_handler(
+    message: Message,
+):
+
+    if not message.from_user:
         return
 
-    state = active_tasks[chat_id]
-    state["is_running"] = False
-    await message.answer("⏳ Останавливаю парсинг и подготавливаю итоговые файлы...")
+    if not is_mod(message.from_user.id):
+        return
+
+    scans, feedback = await db.stats()
+
+    total = scans["total"] or 0
+    personal = scans["personal"] or 0
+    work = scans["work"] or 0
+    suspicious = scans["suspicious"] or 0
+    unknown = scans["unknown"] or 0
+
+    feedback_total = feedback["total"] or 0
+    correct = feedback["correct"] or 0
+    partial = feedback["partial"] or 0
+    wrong = feedback["wrong"] or 0
+
+    accuracy = (
+        correct / feedback_total * 100
+        if feedback_total
+        else 0
+    )
+
+    await message.answer(
+        "📊 <b>Статистика бота</b>\n\n"
+        f"Всего проверок: <b>{total}</b>\n\n"
+        f"🟢 Рабочих: {work}\n"
+        f"🔴 Личных: {personal}\n"
+        f"🟠 Подозрительных: {suspicious}\n"
+        f"⚪ Неизвестных: {unknown}\n\n"
+        "<b>Оценки модераторов:</b>\n"
+        f"Всего: {feedback_total}\n"
+        f"✅ Верно: {correct}\n"
+        f"⚠️ Частично: {partial}\n"
+        f"❌ Ошибка: {wrong}\n\n"
+        f"<b>Текущая точность:</b> "
+        f"{accuracy:.1f}%"
+    )
+
+
+@router.message(Command("rules"))
+async def rules_handler(
+    message: Message,
+):
+
+    if not message.from_user:
+        return
+
+    if not is_mod(message.from_user.id):
+        return
+
+    text = "📚 <b>Правила классификации</b>\n\n"
+
+    for rule, description in RULES_TEXT.items():
+        text += (
+            f"<b>{rule}</b> — "
+            f"{html.escape(description)}\n\n"
+        )
+
+    await message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("help"))
+async def help_handler(
+    message: Message,
+):
+
+    await message.answer(
+        "🔎 <b>Resource Checker</b>\n\n"
+        "Просто отправь ссылку в чат.\n"
+        "Бот проверит ресурс и цепочку "
+        "связанных ссылок.\n\n"
+        "<b>Команды модератора:</b>\n"
+        "/stats — статистика\n"
+        "/rules — правила классификации\n"
+        "/help — помощь",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
 
 async def main():
-    await dp.start_polling(bot)
+
+    global http
+
+    await db.init()
+
+    http = HttpClient()
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default={
+            "parse_mode": ParseMode.HTML,
+        },
+    )
+
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    log.info("Bot started")
+    log.info("Database: %s", DB_PATH)
+    log.info("Moderator chat: %s", MOD_CHAT_ID)
+
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=(
+                dp.resolve_used_update_types()
+            ),
+        )
+    finally:
+        await http.close()
+        await bot.session.close()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Bot stopped")
