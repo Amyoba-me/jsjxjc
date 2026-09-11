@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import parse_qs, urldefrag, urljoin, urlparse
 
 import aiohttp
 import aiosqlite
@@ -224,14 +224,12 @@ def is_telegram_url(url: str) -> bool:
 def extract_urls(message: Message) -> list[str]:
     result = []
     
-    # 1. Собираем обычные ссылки и @упоминания из текста регуляркой
     raw_text = message.text or message.caption or ""
     for raw in URL_RE.findall(raw_text):
         url = normalize_url(raw)
         if url not in result:
             result.append(url)
 
-    # 2. Собираем скрытые гиперссылки и упоминания из Entities ( markdown-стиль в телеграм )
     entities = message.entities or message.caption_entities or []
     for entity in entities:
         if entity.type == "text_link" and entity.url:
@@ -302,6 +300,45 @@ def get_telegram_target(url: str):
         return username, message_id
 
     return parts[0], None
+
+
+def extract_telegram_links(element, base_username: str = "") -> set[str]:
+    """Извлекает гиперссылки, кнопки и упоминания из HTML-элементов Telegram."""
+    extracted = set()
+    if not element:
+        return extracted
+
+    for a in element.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+
+        if "t.me/iv?" in href and "url=" in href:
+            try:
+                parsed_q = parse_qs(urlparse(href).query)
+                if "url" in parsed_q:
+                    for real_url in parsed_q["url"]:
+                        extracted.add(normalize_url(real_url))
+                    continue
+            except Exception:
+                pass
+
+        if href.startswith("//"):
+            href = f"https:{href}"
+        elif href.startswith("/"):
+            if base_username and not href.startswith("/s/"):
+                href = f"https://t.me{href}"
+            elif href.startswith("/s/"):
+                href = f"https://t.me{href}"
+
+        if href.startswith("tg://resolve?domain="):
+            domain = href.split("domain=")[-1].split("&")[0]
+            href = f"https://t.me/{domain}"
+
+        if re.match(r"^(https?://|t\.me/|telegram\.me/|@[a-zA-Z0-9_]{5,32})", href, re.I):
+            extracted.add(normalize_url(href))
+
+    return extracted
 
 
 # ============================================================
@@ -720,9 +757,9 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                     desc_text = desc_node.get_text(" ", strip=True)
                     if desc_text:
                         texts.append(f"Описание канала: {desc_text}")
+                        links.update(extract_telegram_links(desc_node, username))
                         for raw in URL_RE.findall(desc_text):
-                            u = normalize_url(raw)
-                            links.add(u)
+                            links.add(normalize_url(raw))
     except Exception:
         pass
 
@@ -746,10 +783,12 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
     soup = BeautifulSoup(raw, "lxml")
     
     # Ищем плашку закрепленного сообщения вверху t.me/s/
-    for tag in soup.find_all(class_=re.compile(r"pinned|message_pinned", re.I)):
-        for a_tag in tag.find_all("a", href=True):
-            href = a_tag["href"]
-            if f"/{username}/" in href:
+    pinned_tags = soup.find_all(class_=re.compile(r"pinned", re.I))
+    for tag in pinned_tags:
+        anchors = [tag] if tag.name == "a" else tag.find_all("a", href=True)
+        for a_tag in anchors:
+            href = a_tag.get("href", "")
+            if f"/{username}/" in href or (href.startswith("/") and href.strip("/").isdigit()):
                 full_url = href if href.startswith("http") else f"https://t.me{href}"
                 pinned_messages.add(full_url)
         
@@ -757,11 +796,11 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
         if data_post:
             pinned_messages.add(f"https://t.me/{data_post}")
 
-    for a in soup.select(".tgme_header_link, .tgme_channel_info_header a, a[href*='/{username}/']"):
+    for a in soup.select(".tgme_channel_info_pinned_message, .tgme_widget_message_pinned, a[class*='pinned']"):
         href = a.get("href", "")
-        parts = href.strip("/").split("/")
-        if len(parts) >= 2 and parts[-1].isdigit() and parts[-2] == username:
-            pinned_messages.add(f"https://t.me/{username}/{parts[-1]}")
+        if href:
+            full_url = href if href.startswith("http") else f"https://t.me{href}"
+            pinned_messages.add(full_url)
 
     # Обрабатываем основные посты ленты до лимита
     posts = soup.select(".tgme_widget_message")
@@ -770,26 +809,16 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
         if text_node:
             post_text = text_node.get_text(" ", strip=True)
             texts.append(post_text)
-            
-            # Собираем все ссылки из тегов <a> внутри текста поста (включая скрытые гиперссылки)
-            for a in text_node.find_all("a", href=True):
-                href = (a.get("href") or "").strip()
-                if href:
-                    links.add(normalize_url(href))
-
             for raw in URL_RE.findall(post_text):
-                u = normalize_url(raw)
-                links.add(u)
+                links.add(normalize_url(raw))
+
+        # Собираем гиперссылки и кнопки со всего сообщения
+        links.update(extract_telegram_links(post, username))
 
         if post.find(class_=re.compile(r"round_video")):
             node.has_round_video = True
         if post.find(class_=re.compile(r"voice")):
             node.has_voice = True
-
-        for a in post.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if href.startswith(("http://", "https://", "t.me/")):
-                links.add(normalize_url(href))
 
     # 3. Принудительно запрашиваем закрепленные сообщения и целевой message_id через ?embed=1
     target_messages = pinned_messages.copy()
@@ -809,26 +838,16 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                         if text_node:
                             post_text = text_node.get_text(" ", strip=True)
                             texts.append(post_text)
-
-                            # Собираем скрытые гиперссылки из тегов <a> в закрепленном/целевом посте
-                            for a in text_node.find_all("a", href=True):
-                                href = (a.get("href") or "").strip()
-                                if href:
-                                    links.add(normalize_url(href))
-
                             for raw in URL_RE.findall(post_text):
-                                u = normalize_url(raw)
-                                links.add(u)
-                        
+                                links.add(normalize_url(raw))
+
+                        # Собираем гиперссылки и кнопки из закрепленного/целевого поста
+                        links.update(extract_telegram_links(post, username))
+
                         if post.find(class_=re.compile(r"round_video")):
                             node.has_round_video = True
                         if post.find(class_=re.compile(r"voice")):
                             node.has_voice = True
-
-                        for a in post.find_all("a", href=True):
-                            href = (a.get("href") or "").strip()
-                            if href.startswith(("http://", "https://", "t.me/")):
-                                links.add(normalize_url(href))
         except Exception:
             pass
 
