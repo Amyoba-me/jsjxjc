@@ -1962,6 +1962,9 @@ async def help_handler(
 # STARTUP
 # ============================================================
 
+from aiogram.client.default import DefaultBotProperties
+
+
 async def main():
 
     global http
@@ -1972,9 +1975,9 @@ async def main():
 
     bot = Bot(
         token=BOT_TOKEN,
-        default={
-            "parse_mode": ParseMode.HTML,
-        },
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        ),
     )
 
     dp = Dispatcher()
@@ -1994,7 +1997,6 @@ async def main():
     finally:
         await http.close()
         await bot.session.close()
-
 
 if __name__ == "__main__":
     try:
