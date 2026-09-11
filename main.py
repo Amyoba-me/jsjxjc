@@ -770,6 +770,13 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
         if text_node:
             post_text = text_node.get_text(" ", strip=True)
             texts.append(post_text)
+            
+            # Собираем все ссылки из тегов <a> внутри текста поста (включая скрытые гиперссылки)
+            for a in text_node.find_all("a", href=True):
+                href = (a.get("href") or "").strip()
+                if href:
+                    links.add(normalize_url(href))
+
             for raw in URL_RE.findall(post_text):
                 u = normalize_url(raw)
                 links.add(u)
@@ -802,6 +809,13 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                         if text_node:
                             post_text = text_node.get_text(" ", strip=True)
                             texts.append(post_text)
+
+                            # Собираем скрытые гиперссылки из тегов <a> в закрепленном/целевом посте
+                            for a in text_node.find_all("a", href=True):
+                                href = (a.get("href") or "").strip()
+                                if href:
+                                    links.add(normalize_url(href))
+
                             for raw in URL_RE.findall(post_text):
                                 u = normalize_url(raw)
                                 links.add(u)
