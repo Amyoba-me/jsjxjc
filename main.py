@@ -5,9 +5,9 @@ Environment variables:
     BOT_TOKEN              required
     MOD_CHAT_ID            required
     DB_PATH                optional, default /data/checker.db
-    MAX_DEPTH              optional, default 3
-    MAX_RESOURCES          optional, default 40
-    MAX_TELEGRAM_POSTS     optional, default 200
+    MAX_DEPTH              optional, default 2
+    MAX_RESOURCES          optional, default 20
+    MAX_TELEGRAM_POSTS     optional, default 30
     REQUEST_TIMEOUT        optional, default 15
     MIN_ALERT_SCORE        optional, default 55
     ADMIN_IDS              optional, comma-separated Telegram IDs
@@ -61,9 +61,9 @@ DB_PATH = os.getenv(
     "/data/checker.db",
 )
 
-MAX_DEPTH = int(os.getenv("MAX_DEPTH", "40"))
-MAX_RESOURCES = int(os.getenv("MAX_RESOURCES", "500"))
-MAX_TELEGRAM_POSTS = int(os.getenv("MAX_TELEGRAM_POSTS", "500"))
+MAX_DEPTH = int(os.getenv("MAX_DEPTH", "2"))
+MAX_RESOURCES = int(os.getenv("MAX_RESOURCES", "20"))
+MAX_TELEGRAM_POSTS = int(os.getenv("MAX_TELEGRAM_POSTS", "30"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 MIN_ALERT_SCORE = int(os.getenv("MIN_ALERT_SCORE", "55"))
 
@@ -138,6 +138,7 @@ URL_RE = re.compile(
     r"https?://[^\s<>\"]+"
     r"|www\.[^\s<>\"]+"
     r"|t\.me/[^\s<>\"]+"
+    r"|telegram\.me/[^\s<>\"]+"
     r"|@[a-zA-Z0-9_]{5,32}"
     r")"
 )
@@ -196,7 +197,7 @@ def normalize_url(url: str) -> str:
         url = "https://t.me/" + url[1:]
     elif url.startswith("www."):
         url = "https://" + url
-    elif url.startswith("t.me/"):
+    elif url.startswith("t.me/") or url.startswith("telegram.me/"):
         url = "https://" + url
     elif not re.match(r"^https?://", url, re.I):
         url = "https://" + url
@@ -761,7 +762,7 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
 
         for a in post.find_all("a", href=True):
             href = (a.get("href") or "").strip()
-            if href.startswith(("http://", "https://")):
+            if href.startswith(("http://", "https://", "t.me/")):
                 links.add(normalize_url(href))
 
     # 3. Принудительно запрашиваем закрепленные сообщения и целевой message_id через ?embed=1
@@ -792,7 +793,7 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
 
                         for a in post.find_all("a", href=True):
                             href = (a.get("href") or "").strip()
-                            if href.startswith(("http://", "https://")):
+                            if href.startswith(("http://", "https://", "t.me/")):
                                 links.add(normalize_url(href))
         except Exception:
             pass
@@ -800,6 +801,7 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
     node.text = "\n".join(texts)[:50000]
     node.links = list(links)
     return node
+
 
 # ============================================================
 # RECURSIVE CRAWLER
@@ -858,7 +860,7 @@ PATTERNS = {
         r"\bличный контент\b",
         r"\bосновной\b",
         r"\bосновнойтгк\b",
-        r"\bосновной тгк\b"
+        r"\bосновной тгк\b",
         r"\bоснова\b",
         r"\bповседневн\b",
         r"\bмоя жизнь\b",
@@ -1337,7 +1339,6 @@ async def process_url(message: Message, url: str):
 
 @router.message(F.text)
 async def message_handler(message: Message):
-    # Собираем ссылки из текста самого сообщения, куда скинули ссылку
     urls = extract_urls(message.text or "")
     for url in urls[:5]:
         await process_url(message, url)
@@ -1345,10 +1346,10 @@ async def message_handler(message: Message):
 
 @router.message(F.caption)
 async def caption_handler(message: Message):
-    # Собираем ссылки из подписи к медиа
     urls = extract_urls(message.caption or "")
     for url in urls[:5]:
         await process_url(message, url)
+
 
 # ============================================================
 # FEEDBACK HANDLERS
