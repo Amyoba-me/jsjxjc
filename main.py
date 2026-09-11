@@ -61,9 +61,9 @@ DB_PATH = os.getenv(
     "/data/checker.db",
 )
 
-MAX_DEPTH = int(os.getenv("MAX_DEPTH", "3"))
-MAX_RESOURCES = int(os.getenv("MAX_RESOURCES", "40"))
-MAX_TELEGRAM_POSTS = int(os.getenv("MAX_TELEGRAM_POSTS", "200"))
+MAX_DEPTH = int(os.getenv("MAX_DEPTH", "40"))
+MAX_RESOURCES = int(os.getenv("MAX_RESOURCES", "500"))
+MAX_TELEGRAM_POSTS = int(os.getenv("MAX_TELEGRAM_POSTS", "500"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 MIN_ALERT_SCORE = int(os.getenv("MIN_ALERT_SCORE", "55"))
 
@@ -138,6 +138,7 @@ URL_RE = re.compile(
     r"https?://[^\s<>\"]+"
     r"|www\.[^\s<>\"]+"
     r"|t\.me/[^\s<>\"]+"
+    r"|@[a-zA-Z0-9_]{5,32}"
     r")"
 )
 
@@ -191,7 +192,9 @@ def utc_now() -> str:
 def normalize_url(url: str) -> str:
     url = url.strip().strip(".,;:!?)]}>\"'")
 
-    if url.startswith("www."):
+    if url.startswith("@"):
+        url = "https://t.me/" + url[1:]
+    elif url.startswith("www."):
         url = "https://" + url
     elif url.startswith("t.me/"):
         url = "https://" + url
@@ -699,6 +702,8 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                     desc_text = desc_node.get_text(" ", strip=True)
                     if desc_text:
                         texts.append(f"Описание канала: {desc_text}")
+                        for u in extract_urls(desc_text):
+                            links.add(u)
     except Exception:
         pass
 
@@ -721,23 +726,18 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
 
     soup = BeautifulSoup(raw, "lxml")
     
-    # Ищем плашку закрепленного сообщения вверху t.me/s/ (обычно имеет классы с 'pinned' или 'widget_message_wrap')
-    # Вытаскиваем из неё ссылки на конкретный пост (например, href="/username/123" или data-post="username/123")
+    # Ищем плашку закрепленного сообщения вверху t.me/s/
     for tag in soup.find_all(class_=re.compile(r"pinned|message_pinned", re.I)):
-        # Проверяем все ссылки внутри блока закрепа
         for a_tag in tag.find_all("a", href=True):
             href = a_tag["href"]
             if f"/{username}/" in href:
                 full_url = href if href.startswith("http") else f"https://t.me{href}"
                 pinned_messages.add(full_url)
         
-        # Проверяем data-атрибуты
         data_post = tag.get("data-post")
         if data_post:
             pinned_messages.add(f"https://t.me/{data_post}")
 
-    # Дополнительно: сканируем ВСЕ ссылки на самой странице на предмет наличия id поста закрепа, 
-    # если они попадаются в шапке канала
     for a in soup.select(".tgme_header_link, .tgme_channel_info_header a, a[href*='/{username}/']"):
         href = a.get("href", "")
         parts = href.strip("/").split("/")
@@ -749,7 +749,10 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
     for post in posts[:MAX_TELEGRAM_POSTS]:
         text_node = post.select_one(".tgme_widget_message_text")
         if text_node:
-            texts.append(text_node.get_text(" ", strip=True))
+            post_text = text_node.get_text(" ", strip=True)
+            texts.append(post_text)
+            for u in extract_urls(post_text):
+                links.add(u)
 
         if post.find(class_=re.compile(r"round_video")):
             node.has_round_video = True
@@ -777,7 +780,10 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                     for post in specific_soup.select(".tgme_widget_message"):
                         text_node = post.select_one(".tgme_widget_message_text")
                         if text_node:
-                            texts.append(text_node.get_text(" ", strip=True))
+                            post_text = text_node.get_text(" ", strip=True)
+                            texts.append(post_text)
+                            for u in extract_urls(post_text):
+                                links.add(u)
                         
                         if post.find(class_=re.compile(r"round_video")):
                             node.has_round_video = True
@@ -794,7 +800,6 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
     node.text = "\n".join(texts)[:50000]
     node.links = list(links)
     return node
-
 
 # ============================================================
 # RECURSIVE CRAWLER
@@ -852,7 +857,7 @@ PATTERNS = {
         r"\bличное\b",
         r"\bличный контент\b",
         r"\bосновной\b",
-        r"\bосновнойтгк\",
+        r"\bосновнойтгк\b",
         r"\bосновной тгк\b"
         r"\bоснова\b",
         r"\bповседневн\b",
@@ -1332,6 +1337,7 @@ async def process_url(message: Message, url: str):
 
 @router.message(F.text)
 async def message_handler(message: Message):
+    # Собираем ссылки из текста самого сообщения, куда скинули ссылку
     urls = extract_urls(message.text or "")
     for url in urls[:5]:
         await process_url(message, url)
@@ -1339,10 +1345,10 @@ async def message_handler(message: Message):
 
 @router.message(F.caption)
 async def caption_handler(message: Message):
+    # Собираем ссылки из подписи к медиа
     urls = extract_urls(message.caption or "")
     for url in urls[:5]:
         await process_url(message, url)
-
 
 # ============================================================
 # FEEDBACK HANDLERS
