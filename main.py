@@ -54,7 +54,7 @@ from bs4 import BeautifulSoup
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MOD_CHAT_ID = int(os.getenv("MOD_CHAT_ID", "0"))
+MOD_CHAT_ID = int(os.getenv("MOD_CHAT_ID", "0")) if os.getenv("MOD_CHAT_ID") else 0
 
 DB_PATH = os.getenv(
     "DB_PATH",
@@ -74,12 +74,6 @@ ADMIN_IDS = {
 }
 
 USER_AGENT = "Mozilla/5.0 (compatible; TelegramResourceChecker/2.0)"
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not configured")
-
-if not MOD_CHAT_ID:
-    raise RuntimeError("MOD_CHAT_ID is not configured")
 
 
 # ============================================================
@@ -134,7 +128,7 @@ RULES_TEXT = {
 }
 
 URL_RE = re.compile(
-    r"(?i)\b("
+    r"(?i)\b(?:"
     r"https?://[^\s<>\"]+"
     r"|www\.[^\s<>\"]+"
     r"|t\.me/[^\s<>\"]+"
@@ -225,8 +219,8 @@ def extract_urls(message: Message) -> list[str]:
     result = []
     
     raw_text = message.text or message.caption or ""
-    for raw in URL_RE.findall(raw_text):
-        url = normalize_url(raw)
+    for match in URL_RE.finditer(raw_text):
+        url = normalize_url(match.group(0))
         if url not in result:
             result.append(url)
 
@@ -237,9 +231,7 @@ def extract_urls(message: Message) -> list[str]:
             if url not in result:
                 result.append(url)
         elif entity.type == "mention":
-            offset = entity.offset
-            length = entity.length
-            mention_text = raw_text[offset : offset + length]
+            mention_text = entity.extract_from(raw_text)
             url = normalize_url(mention_text)
             if url not in result:
                 result.append(url)
@@ -466,6 +458,35 @@ class Database:
             await db.commit()
             return cursor.lastrowid
 
+    async def save_resources(self, nodes: list[ResourceNode], result: Classification):
+        now = utc_now()
+        async with aiosqlite.connect(self.path) as db:
+            for node in nodes:
+                await db.execute(
+                    """
+                    INSERT OR REPLACE INTO resources (
+                        url,
+                        resource_type,
+                        features,
+                        verdict,
+                        score,
+                        verified,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        node.url,
+                        "telegram" if node.telegram else "web",
+                        json.dumps(result.features, ensure_ascii=False),
+                        result.verdict,
+                        result.score,
+                        0,
+                        now,
+                    ),
+                )
+            await db.commit()
+
     async def add_feedback(
         self,
         scan_id: int,
@@ -648,10 +669,11 @@ class HttpClient:
         )
 
     async def close(self):
-        await self.session.close()
+        if self.session and not self.session.closed:
+            await self.session.close()
 
-    async def get(self, url: str):
-        return await self.session.get(url, allow_redirects=True)
+    def get(self, url: str):
+        return self.session.get(url, allow_redirects=True)
 
 
 http: Optional[HttpClient] = None
@@ -674,7 +696,7 @@ async def fetch_web_page(url: str) -> ResourceNode:
         return node
 
     try:
-        async with await http.get(url) as response:
+        async with http.get(url) as response:
             node.final_url = str(response.url)
 
             content_type = response.headers.get("Content-Type", "").lower()
@@ -748,7 +770,7 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
     # 1. Извлекаем описание (Bio) со страницы профиля t.me/username
     try:
         info_url = f"https://t.me/{username}"
-        async with await http.get(info_url) as response:
+        async with http.get(info_url) as response:
             if response.status == 200:
                 raw_info = await response.text(errors="ignore")
                 info_soup = BeautifulSoup(raw_info, "lxml")
@@ -758,15 +780,15 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                     if desc_text:
                         texts.append(f"Описание канала: {desc_text}")
                         links.update(extract_telegram_links(desc_node, username))
-                        for raw in URL_RE.findall(desc_text):
-                            links.add(normalize_url(raw))
+                        for match in URL_RE.finditer(desc_text):
+                            links.add(normalize_url(match.group(0)))
     except Exception:
         pass
 
     # 2. Получаем посты через /s/ и ищем закреп
     public_url = f"https://t.me/s/{username}"
     try:
-        async with await http.get(public_url) as response:
+        async with http.get(public_url) as response:
             node.final_url = str(response.url)
 
             if response.status != 200:
@@ -809,8 +831,8 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
         if text_node:
             post_text = text_node.get_text(" ", strip=True)
             texts.append(post_text)
-            for raw in URL_RE.findall(post_text):
-                links.add(normalize_url(raw))
+            for match in URL_RE.finditer(post_text):
+                links.add(normalize_url(match.group(0)))
 
         # Собираем гиперссылки и кнопки со всего сообщения
         links.update(extract_telegram_links(post, username))
@@ -828,7 +850,7 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
     for msg_url in target_messages:
         try:
             fetch_url = msg_url if "?embed" in msg_url else f"{msg_url}?embed=1"
-            async with await http.get(fetch_url) as response:
+            async with http.get(fetch_url) as response:
                 if response.status == 200:
                     raw_specific = await response.text(errors="ignore")
                     specific_soup = BeautifulSoup(raw_specific, "lxml")
@@ -838,8 +860,8 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                         if text_node:
                             post_text = text_node.get_text(" ", strip=True)
                             texts.append(post_text)
-                            for raw in URL_RE.findall(post_text):
-                                links.add(normalize_url(raw))
+                            for match in URL_RE.finditer(post_text):
+                                links.add(normalize_url(match.group(0)))
 
                         # Собираем гиперссылки и кнопки из закрепленного/целевого поста
                         links.update(extract_telegram_links(post, username))
@@ -1150,8 +1172,6 @@ async def classify(nodes: list[ResourceNode]) -> Classification:
         verdict = "PERSONAL"
     elif score >= MIN_ALERT_SCORE:
         verdict = "SUSPICIOUS"
-    elif work_signals >= 2 and score < 45:
-        verdict = "WORK"
     elif score < 45:
         verdict = "WORK"
     else:
@@ -1214,12 +1234,12 @@ def build_report(
         )
 
     report += "\n<b>Причины:</b>\n"
-    for reason in result.reasons:
+    for reason in result.reasons[:10]:
         report += f"• {html.escape(reason)}\n"
 
     if result.rules:
         report += "\n<b>Связанные статьи:</b>\n"
-        for rule in result.rules:
+        for rule in result.rules[:10]:
             report += f"• {rule}\n"
 
     report += (
@@ -1239,7 +1259,7 @@ def build_report(
             )
 
     report += f"\n<code>SCAN #{scan_id}</code>"
-    return report
+    return report[:4000]
 
 
 def feedback_keyboard(scan_id: int):
@@ -1298,7 +1318,7 @@ router = Router()
 
 
 def is_mod(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return user_id in ADMIN_IDS if ADMIN_IDS else True
 
 
 async def process_url(message: Message, url: str):
@@ -1329,35 +1349,7 @@ async def process_url(message: Message, url: str):
         chain=[node.url for node in nodes],
     )
 
-    async with aiosqlite.connect(DB_PATH) as database:
-        now = utc_now()
-
-        for node in nodes:
-            await database.execute(
-                """
-                INSERT OR REPLACE INTO resources (
-                    url,
-                    resource_type,
-                    features,
-                    verdict,
-                    score,
-                    verified,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    node.url,
-                    "telegram" if node.telegram else "web",
-                    json.dumps(result.features, ensure_ascii=False),
-                    result.verdict,
-                    result.score,
-                    0,
-                    now,
-                ),
-            )
-
-        await database.commit()
+    await db.save_resources(nodes, result)
 
     if result.verdict == "WORK":
         await message.reply(
@@ -1379,13 +1371,14 @@ async def process_url(message: Message, url: str):
     if result.verdict == "UNKNOWN":
         report = "🟠 <b>ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА</b>\n\n" + report
 
-    await message.bot.send_message(
-        chat_id=MOD_CHAT_ID,
-        text=report,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-        reply_markup=feedback_keyboard(scan_id),
-    )
+    if MOD_CHAT_ID:
+        await message.bot.send_message(
+            chat_id=MOD_CHAT_ID,
+            text=report,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=feedback_keyboard(scan_id),
+        )
 
     await message.reply("⚠️ Результат отправлен модераторам на проверку.")
 
@@ -1413,7 +1406,7 @@ async def feedback_handler(callback: CallbackQuery):
     if not callback.message:
         return
 
-    if callback.message.chat.id != MOD_CHAT_ID:
+    if MOD_CHAT_ID and callback.message.chat.id != MOD_CHAT_ID:
         await callback.answer("Недоступно", show_alert=True)
         return
 
@@ -1445,7 +1438,7 @@ async def feedback_handler(callback: CallbackQuery):
                 verdict=scan["verdict"],
                 rules=rules,
                 resource_type=(
-                    "telegram" if "t.me/" in scan["original_url"] else "web"
+                    "telegram" if is_telegram_url(scan["original_url"]) else "web"
                 ),
             )
         except Exception:
@@ -1478,7 +1471,7 @@ async def correction_handler(callback: CallbackQuery):
     if not callback.message:
         return
 
-    if callback.message.chat.id != MOD_CHAT_ID:
+    if MOD_CHAT_ID and callback.message.chat.id != MOD_CHAT_ID:
         await callback.answer("Недоступно", show_alert=True)
         return
 
@@ -1514,7 +1507,7 @@ async def correction_handler(callback: CallbackQuery):
             verdict=verdict,
             rules=rules,
             resource_type=(
-                "telegram" if "t.me/" in scan["original_url"] else "web"
+                "telegram" if is_telegram_url(scan["original_url"]) else "web"
             ),
         )
     except Exception:
@@ -1608,6 +1601,9 @@ async def help_handler(message: Message):
 async def main():
     global http
 
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is not set")
+
     await db.init()
     http = HttpClient()
 
@@ -1621,7 +1617,7 @@ async def main():
 
     log.info("Bot started")
     log.info("Database: %s", DB_PATH)
-    log.info("Moderator chat: %s", MOD_CHAT_ID)
+    log.info("Moderator chat: %s", MOD_CHAT_ID or "Not set")
 
     try:
         await dp.start_polling(
