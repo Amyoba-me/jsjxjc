@@ -221,13 +221,30 @@ def is_telegram_url(url: str) -> bool:
         return False
 
 
-def extract_urls(text: str) -> list[str]:
+def extract_urls(message: Message) -> list[str]:
     result = []
-
-    for raw in URL_RE.findall(text or ""):
+    
+    # 1. Собираем обычные ссылки и @упоминания из текста регуляркой
+    raw_text = message.text or message.caption or ""
+    for raw in URL_RE.findall(raw_text):
         url = normalize_url(raw)
         if url not in result:
             result.append(url)
+
+    # 2. Собираем скрытые гиперссылки и упоминания из Entities ( markdown-стиль в телеграм )
+    entities = message.entities or message.caption_entities or []
+    for entity in entities:
+        if entity.type == "text_link" and entity.url:
+            url = normalize_url(entity.url)
+            if url not in result:
+                result.append(url)
+        elif entity.type == "mention":
+            offset = entity.offset
+            length = entity.length
+            mention_text = raw_text[offset : offset + length]
+            url = normalize_url(mention_text)
+            if url not in result:
+                result.append(url)
 
     return result
 
@@ -703,7 +720,8 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                     desc_text = desc_node.get_text(" ", strip=True)
                     if desc_text:
                         texts.append(f"Описание канала: {desc_text}")
-                        for u in extract_urls(desc_text):
+                        for raw in URL_RE.findall(desc_text):
+                            u = normalize_url(raw)
                             links.add(u)
     except Exception:
         pass
@@ -752,7 +770,8 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
         if text_node:
             post_text = text_node.get_text(" ", strip=True)
             texts.append(post_text)
-            for u in extract_urls(post_text):
+            for raw in URL_RE.findall(post_text):
+                u = normalize_url(raw)
                 links.add(u)
 
         if post.find(class_=re.compile(r"round_video")):
@@ -783,7 +802,8 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                         if text_node:
                             post_text = text_node.get_text(" ", strip=True)
                             texts.append(post_text)
-                            for u in extract_urls(post_text):
+                            for raw in URL_RE.findall(post_text):
+                                u = normalize_url(raw)
                                 links.add(u)
                         
                         if post.find(class_=re.compile(r"round_video")):
@@ -1339,14 +1359,14 @@ async def process_url(message: Message, url: str):
 
 @router.message(F.text)
 async def message_handler(message: Message):
-    urls = extract_urls(message.text or "")
+    urls = extract_urls(message)
     for url in urls[:5]:
         await process_url(message, url)
 
 
 @router.message(F.caption)
 async def caption_handler(message: Message):
-    urls = extract_urls(message.caption or "")
+    urls = extract_urls(message)
     for url in urls[:5]:
         await process_url(message, url)
 
