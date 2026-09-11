@@ -7,7 +7,7 @@ Environment variables:
     DB_PATH                optional, default /data/checker.db
     MAX_DEPTH              optional, default 3
     MAX_RESOURCES          optional, default 40
-    MAX_TELEGRAM_POSTS     optional, default 40
+    MAX_TELEGRAM_POSTS     optional, default 200
     REQUEST_TIMEOUT        optional, default 15
     MIN_ALERT_SCORE        optional, default 55
     ADMIN_IDS              optional, comma-separated Telegram IDs
@@ -63,7 +63,7 @@ DB_PATH = os.getenv(
 
 MAX_DEPTH = int(os.getenv("MAX_DEPTH", "3"))
 MAX_RESOURCES = int(os.getenv("MAX_RESOURCES", "40"))
-MAX_TELEGRAM_POSTS = int(os.getenv("MAX_TELEGRAM_POSTS", "40"))
+MAX_TELEGRAM_POSTS = int(os.getenv("MAX_TELEGRAM_POSTS", "200"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 MIN_ALERT_SCORE = int(os.getenv("MIN_ALERT_SCORE", "55"))
 
@@ -682,8 +682,28 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
         return node
 
     username, message_id = target
-    public_url = f"https://t.me/s/{username}"
+    
+    texts = []
+    links = set()
+    pinned_messages = set()
+    
+    # 1. Извлекаем описание (Bio) со страницы профиля t.me/username
+    try:
+        info_url = f"https://t.me/{username}"
+        async with await http.get(info_url) as response:
+            if response.status == 200:
+                raw_info = await response.text(errors="ignore")
+                info_soup = BeautifulSoup(raw_info, "lxml")
+                desc_node = info_soup.select_one(".tgme_page_description")
+                if desc_node:
+                    desc_text = desc_node.get_text(" ", strip=True)
+                    if desc_text:
+                        texts.append(f"Описание канала: {desc_text}")
+    except Exception:
+        pass
 
+    # 2. Получаем посты через /s/
+    public_url = f"https://t.me/s/{username}"
     try:
         async with await http.get(public_url) as response:
             node.final_url = str(response.url)
@@ -694,64 +714,76 @@ async def fetch_telegram_resource(url: str) -> ResourceNode:
                 return node
 
             raw = await response.text(errors="ignore")
-
     except Exception as exc:
         node.accessible = False
         node.error = f"{type(exc).__name__}: {exc}"
         return node
 
     soup = BeautifulSoup(raw, "lxml")
+    
+    # Поиск закреплённых постов (ищем классы с 'pinned' и data-post)
+    for tag in soup.find_all(class_=re.compile(r"pinned", re.I)):
+        href = tag.get("href")
+        if href and f"/{username}/" in href:
+            href_clean = href if href.startswith("http") else f"https://t.me{href}"
+            pinned_messages.add(href_clean)
+            
+        data_post = tag.get("data-post")
+        if data_post and data_post.startswith(f"{username}/"):
+            pinned_messages.add(f"https://t.me/{data_post}")
+
+    # Обрабатываем основные посты до лимита
     posts = soup.select(".tgme_widget_message")
-
-    texts = []
-    links = set()
-
     for post in posts[:MAX_TELEGRAM_POSTS]:
         text_node = post.select_one(".tgme_widget_message_text")
 
         if text_node:
             texts.append(text_node.get_text(" ", strip=True))
 
-        # --- НОВАЯ ЛОГИКА ДЕТЕКТА МЕДИАФАЙЛОВ ---
         if post.find(class_=re.compile(r"round_video")):
             node.has_round_video = True
         
         if post.find(class_=re.compile(r"voice")):
             node.has_voice = True
-        # ----------------------------------------
 
         for a in post.find_all("a", href=True):
             href = (a.get("href") or "").strip()
             if href.startswith(("http://", "https://")):
                 links.add(normalize_url(href))
 
-    node.text = "\n".join(texts)[:50000]
-    node.links = list(links)
-
+    # 3. Принудительно парсим закрепленные сообщения и целевой message_id (вне лимита 200 постов)
+    target_messages = pinned_messages.copy()
     if message_id:
-        specific_url = f"https://t.me/{username}/{message_id}"
-
+        target_messages.add(f"https://t.me/{username}/{message_id}")
+        
+    for msg_url in target_messages:
         try:
-            async with await http.get(specific_url) as response:
+            # ?embed=1 надёжнее для парсинга единичных постов через виджет
+            fetch_url = msg_url if "?embed" in msg_url else f"{msg_url}?embed=1"
+            async with await http.get(fetch_url) as response:
                 if response.status == 200:
                     raw_specific = await response.text(errors="ignore")
                     specific_soup = BeautifulSoup(raw_specific, "lxml")
 
                     for post in specific_soup.select(".tgme_widget_message"):
                         text_node = post.select_one(".tgme_widget_message_text")
-
                         if text_node:
-                            node.text += "\n" + text_node.get_text(" ", strip=True)
+                            texts.append(text_node.get_text(" ", strip=True))
+                        
+                        if post.find(class_=re.compile(r"round_video")):
+                            node.has_round_video = True
+                        if post.find(class_=re.compile(r"voice")):
+                            node.has_voice = True
 
                         for a in post.find_all("a", href=True):
                             href = (a.get("href") or "").strip()
                             if href.startswith(("http://", "https://")):
-                                node.links.append(normalize_url(href))
-
+                                links.add(normalize_url(href))
         except Exception:
             pass
 
-    node.links = list(dict.fromkeys(node.links))
+    node.text = "\n".join(texts)[:50000]
+    node.links = list(links)
     return node
 
 
@@ -915,7 +947,6 @@ def detect_features(nodes: list[ResourceNode]) -> dict:
     )
     features["has_external_links"] = any(node.links for node in nodes)
     
-    # --- НОВЫЕ ФИЧИ МЕДИАКУЛЮЧЕЙ ---
     features["has_round_video"] = any(getattr(node, "has_round_video", False) for node in nodes)
     features["has_voice"] = any(getattr(node, "has_voice", False) for node in nodes)
 
@@ -1094,7 +1125,7 @@ def build_report(
 
     report = (
         "🚨 <b>ПРОВЕРКА РЕСУРСА</b>\n\n"
-        f"<b>Вердикт:</b> {VERDICTS[result.verdict]}\n"
+        f"<b>Вердикт:</b> {VERDIcripts.get(result.verdict, result.verdict)}\n"
         f"<b>Оценка риска:</b> {result.score}/100\n"
         f"<b>Уверенность:</b> {round(result.confidence * 100)}%\n\n"
         f"<b>Исходная ссылка:</b>\n"
@@ -1225,7 +1256,6 @@ async def process_url(message: Message, url: str):
         chain=[node.url for node in nodes],
     )
 
-    # Store resource information.
     async with aiosqlite.connect(DB_PATH) as database:
         now = utc_now()
 
